@@ -138,41 +138,17 @@ The plugin does not upload session content to any external service on its own.
 
 Audit logs are metadata-only by default. They are written locally under `~/.config/opencode/session-reflections/`.
 
-## Known Limitations
+## How Session Retrieval Works
 
-### Session history is capped by the SDK
+The OpenCode SDK type `SessionListData` only exposes a `directory` query parameter. The server-side `GET /session` handler accepts additional parameters (`limit`, `start`, `search`) that are not reflected in the SDK type. The plugin works around this by calling the underlying HTTP client directly.
 
-**Background**
+**sessionName search** uses `_client.get("/session", { query: { search, limit, start } })` with server-side `LIKE '%query%'` matching. To search across all workspaces (not just the current directory), the plugin passes `x-opencode-directory: ""` in the request headers. This causes the SDK interceptor's `pick()` function to return `undefined` and skip the directory injection, so the server returns sessions from all workspaces.
 
-The plugin retrieves session lists through the OpenCode SDK (`client.session.list()`). The only supported query parameter is `directory` — there is no `limit`, `page`, or `cursor` argument. The server decides how many sessions to return, and older sessions beyond that window are silently omitted.
+**sessionID lookup** calls `client.session.get({ path: { id } })` directly, bypassing the session list entirely.
 
-In practice this means `/session-review <name>` or `/session-review <id>` will return "no session found" for sessions that exist in the local database but fall outside the API's return window. With 200+ sessions accumulated over time, sessions older than a few weeks may not be reachable.
+**Default (limit N)** pages through `GET /session` in batches of 200 with the same directory suppression, then applies client-side recency sorting.
 
-**Root cause**
-
-`SessionListData` in the OpenCode SDK (as of v1.17.x) is defined as:
-
-```ts
-type SessionListData = {
-  query?: { directory?: string };
-};
-```
-
-No pagination controls are exposed.
-
-**Workaround (current)**
-
-Pass the session id directly with `/session-review <session-id>`. The id bypasses name matching but the underlying `session.list()` call still caps the candidate pool, so even a known id may not be found if the session is old enough.
-
-**Proposal**
-
-Two options, in order of preference:
-
-1. **Wait for SDK pagination support.** If a future SDK version adds `limit`/`after` or cursor-based pagination to `session.list()`, the plugin can page through all sessions. This keeps the implementation clean and SDK-compatible.
-
-2. **Direct SQLite fallback.** As a degraded-mode option, the plugin could detect the "not found" case and re-query `~/.local/share/opencode/opencode.db` directly (`SELECT id, title FROM session WHERE ...`). This reaches the full history regardless of API limits, but couples the plugin to the internal database schema and breaks if the schema changes. Should only be used as a last resort.
-
-The recommended path is option 1. The limitation should be surfaced to the user with a clear error message when a session id or name is not found (e.g. "Session not found — it may be outside the SDK's return window. Try `/session-review <session-id>` with a recent session, or wait for SDK pagination support.").
+If the SDK type is updated in a future version to expose `limit`, `start`, and `search`, the `listSessionsPaged` function in `src/index.js` can be simplified to use `client.session.list()` directly.
 
 ## Development
 
