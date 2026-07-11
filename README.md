@@ -16,9 +16,24 @@ Each recommendation is evaluated for:
 - Value: frequency, severity, time saved, error prevention, confidence improvement, and usefulness to other OpenCode users.
 - Prior art: whether the official OpenCode repository, OpenCode ecosystem/docs, awesome-opencode/community lists, npm, or GitHub already contain a similar solution that should be reused, configured, extended, or forked instead of rebuilt.
 
-## Local Deploy (Recommended)
+## Installation
 
-This plugin is designed to be deployed directly to your local OpenCode global config directory. No config changes needed — OpenCode auto-discovers plugins in `~/.config/opencode/plugins/`.
+Add the npm package to your OpenCode config:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["opencode-session-reflection"]
+}
+```
+
+Restart OpenCode after changing the config.
+
+This registers the `session_reflection` tool. OpenCode loads slash commands from command directories, so the packaged `commands/session-review.md` file is not assumed to be auto-installed by npm plugin loading.
+
+## Local Development Deploy
+
+For local development, this repository also includes a deploy helper that copies the plugin and slash command into your global OpenCode config directory. No config changes are needed for this path because OpenCode auto-discovers plugins in `~/.config/opencode/plugins/` and commands in `~/.config/opencode/command/`.
 
 **First time setup:**
 
@@ -38,7 +53,7 @@ npm run deploy # copy updated files to the plugins directory
 
 Then restart OpenCode to reload.
 
-**Remove the plugin:**
+**Remove the local development deployment:**
 
 ```sh
 npm run undeploy
@@ -52,22 +67,9 @@ The deploy script:
 - Copies `commands/session-review.md` to `~/.config/opencode/command/session-review.md`
 - Removes legacy entry-points (`session-reflection.mjs`, `session-reflection.ts`) if present, to prevent double-loading
 
-## npm Installation (Alternative)
-
-You can also load the plugin from npm. Add it to your OpenCode config:
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": ["opencode-session-reflection"]
-}
-```
-
-Restart OpenCode after changing the config.
-
 ## Usage
 
-Review the most recent sessions:
+If you used `npm run deploy`, review the most recent sessions with the slash command:
 
 ```text
 /session-review
@@ -168,6 +170,116 @@ Verify the plugin entrypoint imports correctly:
 
 ```sh
 npm run check:import
+```
+
+Inspect the npm package contents before publishing:
+
+```sh
+npm pack --dry-run
+```
+
+## Release Smoke Test
+
+Before publishing, test the packed artifact instead of the source tree or npm cache.
+
+Create a throwaway app and install the generated tarball:
+
+```sh
+SMOKE=/tmp/opencode-session-reflection-smoke
+rm -rf "$SMOKE"
+mkdir -p "$SMOKE/app" "$SMOKE/xdg/opencode" "$SMOKE/home"
+TARBALL=$(npm pack --silent)
+npm install --prefix "$SMOKE/app" "$(pwd)/$TARBALL"
+node -p "require('$SMOKE/app/node_modules/opencode-session-reflection/package.json').version"
+```
+
+Create an isolated OpenCode config at `$SMOKE/xdg/opencode/opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": [
+    "file:///tmp/opencode-session-reflection-smoke/app/node_modules/opencode-session-reflection/src/index.js"
+  ]
+}
+```
+
+Verify OpenCode loads only the tarball-installed plugin:
+
+```sh
+XDG_CONFIG_HOME="$SMOKE/xdg" HOME="$SMOKE/home" opencode debug config
+```
+
+The `plugin_origins` output must point to:
+
+```text
+file:///tmp/opencode-session-reflection-smoke/app/node_modules/opencode-session-reflection/src/index.js
+```
+
+Run an isolated plugin-tool smoke:
+
+```sh
+XDG_CONFIG_HOME="$SMOKE/xdg" HOME="$SMOKE/home" opencode
+```
+
+Ask OpenCode to call `session_reflection` with `action=collect` and `limit=1`.
+The test passes when the tool returns without a plugin import/load error. The
+isolated `HOME` may have no useful historical sessions, so an empty or minimal
+collection is not automatically a plugin failure.
+
+The `/session-review` slash command is a separate command-directory feature.
+This npm smoke verifies the plugin tool. To test the slash command, use
+`npm run deploy` or copy `commands/session-review.md` to
+`~/.config/opencode/command/session-review.md`, then restart OpenCode.
+
+## Publishing
+
+Publish checklist:
+
+```sh
+npm test
+npm run check:import
+npm pack --dry-run
+npm pack
+```
+
+`npm publish` runs `npm test && npm run check:import` automatically through `prepublishOnly`.
+
+Do not publish automatically from an agent run. Stop and wait for an explicit
+human confirmation such as `publish`, `发布`, or `发`, then run:
+
+```sh
+npm publish
+```
+
+After publish, clear OpenCode's npm plugin cache and test the real npm package
+path:
+
+```sh
+rm -rf ~/.cache/opencode/packages/opencode-session-reflection \
+  ~/.cache/opencode/packages/opencode-session-reflection@latest
+```
+
+Use the npm package name in OpenCode config:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["opencode-session-reflection"]
+}
+```
+
+Restart OpenCode and call `session_reflection` again. If a local development
+deployment is still present at `~/.config/opencode/plugins/session-reflection.js`,
+remove the local plugin files or OpenCode will load the package and the local
+auto-discovered plugin at the same time:
+
+```sh
+rm -f ~/.config/opencode/plugins/session-reflection.js \
+  ~/.config/opencode/plugins/session-reflection-core.mjs \
+  ~/.config/opencode/plugins/session-reflection-logging.mjs \
+  ~/.config/opencode/plugins/session-reflection.mjs \
+  ~/.config/opencode/plugins/session-reflection.ts
 ```
 
 ## License

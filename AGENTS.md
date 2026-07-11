@@ -10,7 +10,8 @@ It exposes a `session_reflection` custom tool and a `/session-review` slash comm
 - Runtime: Node.js (ESM, `"type": "module"`)
 - No build step — source files are plain `.js`
 - Test runner: `node --test` (built-in)
-- Deploy: `npm run deploy` copies source to `~/.config/opencode/plugins/`
+- Distribution: npm package `opencode-session-reflection`
+- Local development deploy: `npm run deploy` copies source to `~/.config/opencode/plugins/`
 
 ## Directory Structure
 
@@ -29,17 +30,97 @@ test/
   logging.test.mjs  — unit tests for logging.js
   plugin.test.mjs   — integration tests for the tool via mocked client
   scripts.test.mjs  — tests for deploy/undeploy using real functions + tmp dirs
+docs/superpowers/
+  specs/  — approved design notes for non-trivial changes
+  plans/  — implementation plans for non-trivial changes
 ```
 
 ## Commands
 
 ```sh
 npm install       # install dependencies
-npm test          # run all tests (must pass before deploy)
+npm test          # run all tests
 npm run check:import  # verify plugin entrypoint loads correctly
 npm run deploy    # deploy to ~/.config/opencode/plugins/ (then restart OpenCode)
 npm run undeploy  # remove deployed files
+npm pack --dry-run # inspect npm package contents before publish
+npm publish       # publish package; prepublishOnly runs tests and import check
 ```
+
+## npm Package
+
+This repository is packaged as `opencode-session-reflection` for OpenCode's
+`plugin` config array:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["opencode-session-reflection"]
+}
+```
+
+The package exports `src/index.js` directly. Do not add a build step unless the
+source is migrated away from plain Node-compatible ESM JavaScript.
+
+Published files are controlled by `package.json` `files`. The npm tarball should
+include `src/`, `commands/`, `README.md`, `LICENSE`, and `package.json`; it
+should not include tests, local deploy scripts, docs, or `node_modules/`.
+
+Before publishing, run:
+
+```sh
+npm test
+npm run check:import
+npm pack --dry-run
+npm pack
+```
+
+`prepublishOnly` runs `npm test && npm run check:import` automatically during
+`npm publish`. The dry-run pack check is still required so the tarball contents
+are inspected before release.
+
+Before `npm publish`, also smoke-test the packed tarball from a throwaway app:
+
+```sh
+SMOKE=/tmp/opencode-session-reflection-smoke
+rm -rf "$SMOKE"
+mkdir -p "$SMOKE/app" "$SMOKE/xdg/opencode" "$SMOKE/home"
+TARBALL=$(npm pack --silent)
+npm install --prefix "$SMOKE/app" "$(pwd)/$TARBALL"
+```
+
+Write `$SMOKE/xdg/opencode/opencode.json` with a `file://` plugin entry that
+points to `$SMOKE/app/node_modules/opencode-session-reflection/src/index.js`,
+then run:
+
+```sh
+XDG_CONFIG_HOME="$SMOKE/xdg" HOME="$SMOKE/home" opencode debug config
+```
+
+The `plugin_origins` output must point to the throwaway app's installed
+`src/index.js`, not this source tree and not `~/.cache/opencode/packages`.
+
+Run one plugin-tool smoke by starting OpenCode with the same `XDG_CONFIG_HOME`
+and `HOME`, then ask the agent to call `session_reflection` with
+`action=collect` and `limit=1`. The smoke passes when the tool returns without a
+plugin import/load error. Empty session evidence is acceptable in the isolated
+`HOME`.
+
+Publishing requires explicit human confirmation in the current turn. Do not run
+`npm publish` merely because the checklist passed or because the user mentioned
+publishing earlier.
+
+After publishing, clear OpenCode's npm plugin cache and test the real npm path:
+
+```sh
+rm -rf ~/.cache/opencode/packages/opencode-session-reflection \
+  ~/.cache/opencode/packages/opencode-session-reflection@latest
+```
+
+Restart OpenCode with `plugin: ["opencode-session-reflection"]` and call
+`session_reflection` again. If local development files under
+`~/.config/opencode/plugins/session-reflection*.js` or `.mjs` still exist,
+remove them before the post-publish smoke to avoid double-loading the plugin.
 
 ## Module Boundaries
 
@@ -83,7 +164,10 @@ This avoids the list entirely and works regardless of session age.
 (SDK `"fields"` response style). Use `unwrapSdkArray(res, label)` in `index.js`
 to extract the array and throw a descriptive error on shape mismatch.
 
-## Deploy Script Internals
+## Local Deploy Script Internals
+
+Local deployment is a development helper, not the primary distribution path.
+Published npm users should load the plugin through OpenCode's `plugin` config.
 
 - Helper modules (`core.js`, `logging.js`) are deployed as `.mjs` so OpenCode's
   local plugin auto-discovery glob (`*.js`, `*.ts`) does not treat them as
@@ -106,3 +190,4 @@ All tests use `node --test` with no external test framework.
   runs them against a `mkdtemp` directory.
 
 Run `npm test` before every `npm run deploy`. Do not deploy with failing tests.
+Before npm publishing, also run `npm run check:import` and `npm pack --dry-run`.

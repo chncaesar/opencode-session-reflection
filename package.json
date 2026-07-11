@@ -3,8 +3,10 @@
   "version": "0.1.0",
   "description": "OpenCode plugin for qualitative session reflection and open-source workflow opportunity discovery.",
   "type": "module",
-  "main": "src/index.js",
-  "exports": "./src/index.js",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
   "files": [
     "src",
     "commands",
@@ -14,6 +16,7 @@
   "scripts": {
     "test": "node --test \"test/*.test.mjs\"",
     "check:import": "node -e \"import('./src/index.js').then((m) => { if (typeof m.default !== 'function') throw new Error('default export is not a plugin function'); console.log('plugin import ok') })\"",
+    "prepublishOnly": "npm test && npm run check:import",
     "deploy": "node scripts/deploy.js",
     "undeploy": "node scripts/undeploy.js"
   },
@@ -25,6 +28,14 @@
     "ai-agents",
     "developer-productivity"
   ],
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/chncaesar/opencode-session-reflection.git"
+  },
+  "bugs": {
+    "url": "https://github.com/chncaesar/opencode-session-reflection/issues"
+  },
+  "homepage": "https://github.com/chncaesar/opencode-session-reflection#readme",
   "license": "MIT",
   "dependencies": {
     "@opencode-ai/plugin": "^1.17.11"
