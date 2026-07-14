@@ -67,8 +67,6 @@ const plugin = async ({ client }) => {
 
           const requestedSessionName = args.sessionName?.trim()
 
-          // When a specific session id is requested, fetch it directly instead of
-          // paging through the full list — avoids the SDK return-window limitation.
           let selected
           if (args.sessionID) {
             const res = await client.session.get({ path: { id: args.sessionID } })
@@ -76,12 +74,7 @@ const plugin = async ({ client }) => {
             if (!session || session.error) return `No session found: ${args.sessionID}`
             selected = [session]
           } else {
-            // client.session.list() only exposes `directory` in its SDK type but
-            // the server accepts `limit`, `start`, and `search`. Use _client.get()
-            // to pass these params directly and page through the full history.
-            const sessions = requestedSessionName
-              ? await listSessionsPaged(client._client, { search: requestedSessionName })
-              : await listSessionsPaged(client._client, {})
+            const sessions = await listSessionsPaged(client._client)
             selected = requestedSessionName
               ? selectSessionsByName(sessions, requestedSessionName)
               : selectSessionsForReview(sessions, { limit: args.limit })
@@ -206,20 +199,18 @@ function unwrapSdkArray(response, label) {
  * interceptor's pick() function to return undefined (empty string is falsy),
  * so it skips the injection and the server returns sessions from all workspaces.
  *
+ * Session name / title search is done client-side via selectSessionsByName.
+ *
  * @param {object} rawClient - client._client from the plugin context
- * @param {object} opts
- * @param {string} [opts.search]   - optional server-side title search
  * @param {number} [opts.pageSize] - sessions per request (default 200)
  */
-async function listSessionsPaged(rawClient, { search, pageSize = 200 } = {}) {
-  // Empty string suppresses the directory interceptor (pick("", dir) → undefined).
+async function listSessionsPaged(rawClient, { pageSize = 200 } = {}) {
   const headers = { "x-opencode-directory": "" }
 
   const all = []
   let start = 0
   while (true) {
     const query = { limit: pageSize, start }
-    if (search) query.search = search
     const res = await rawClient.get({ url: "/session", query, headers })
     if (res?.error) throw new Error(`GET /session failed: ${JSON.stringify(res.error)}`)
     const page = Array.isArray(res?.data) ? res.data : []

@@ -142,15 +142,13 @@ Audit logs are metadata-only by default. They are written locally under `~/.conf
 
 ## How Session Retrieval Works
 
-The OpenCode SDK type `SessionListData` only exposes a `directory` query parameter. The server-side `GET /session` handler accepts additional parameters (`limit`, `start`, `search`) that are not reflected in the SDK type. The plugin works around this by calling the underlying HTTP client directly.
+Sessions are fetched through `client._client.get("/session")` because the SDK's `client.session.list()` only exposes `directory` in its TypeScript type. The plugin pages through all sessions in batches of 200, then does all filtering client-side.
 
-**sessionName search** uses `_client.get("/session", { query: { search, limit, start } })` with server-side `LIKE '%query%'` matching. To search across all workspaces (not just the current directory), the plugin passes `x-opencode-directory: ""` in the request headers. This causes the SDK interceptor's `pick()` function to return `undefined` and skip the directory injection, so the server returns sessions from all workspaces.
+**sessionName search** fetches all sessions, then filters client-side via `selectSessionsByName` — exact normalized title match first, then `includes` fallback. To search across all workspaces, the plugin passes `x-opencode-directory: ""` in the request headers, which causes the SDK interceptor's `pick()` function to return `undefined` and skip the directory injection.
 
 **sessionID lookup** calls `client.session.get({ path: { id } })` directly, bypassing the session list entirely.
 
-**Default (limit N)** pages through `GET /session` in batches of 200 with the same directory suppression, then applies client-side recency sorting.
-
-If the SDK type is updated in a future version to expose `limit`, `start`, and `search`, the `listSessionsPaged` function in `src/index.js` can be simplified to use `client.session.list()` directly.
+**Default (limit N)** fetches all sessions with the same directory suppression, then applies `selectSessionsForReview` for recency-based client-side slicing.
 
 ## Development
 
