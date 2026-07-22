@@ -280,6 +280,15 @@ rm -f ~/.config/opencode/plugins/session-reflection.js \
   ~/.config/opencode/plugins/session-reflection.ts
 ```
 
+## More OpenCode Tools
+
+| Tool | Description |
+|------|-------------|
+| [opencode-db-clean](https://github.com/chncaesar/opencode-db-clean) | Reclaim disk space from bloated SQLite databases |
+| [opencode-waitfor](https://github.com/chncaesar/opencode-waitfor) | `wait_for` for HTTP/TCP/command readiness checks |
+| [opencode-session-reflection](https://github.com/chncaesar/opencode-session-reflection) | Qualitative review of past coding sessions |
+| [opencode-fleet](https://github.com/chncaesar/opencode-fleet) | Multi-node remote OpenCode orchestration |
+
 ## License
 
 MIT
