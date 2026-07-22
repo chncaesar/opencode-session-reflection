@@ -18,7 +18,11 @@ Each recommendation is evaluated for:
 
 ## Installation
 
-Add the npm package to your OpenCode config:
+```bash
+npm install -g opencode-session-reflection
+```
+
+Then add to your `opencode.json`:
 
 ```json
 {
