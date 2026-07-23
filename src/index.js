@@ -1,7 +1,9 @@
 // Tested by test/plugin.test.mjs; core behavior is covered by test/core.test.mjs.
-import { mkdir, writeFile } from "node:fs/promises"
+import { execFile } from "node:child_process"
+import { access, mkdir, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join } from "node:path"
+import { promisify } from "node:util"
 import { tool } from "@opencode-ai/plugin"
 
 import {
@@ -20,10 +22,14 @@ import {
   writeRunManifest,
 } from "./logging.js"
 
+const execFileAsync = promisify(execFile)
+
 const LOG_DIR = join(homedir(), ".config", "opencode", "session-reflections")
 const REPORT_DIR = join(LOG_DIR, "reports")
 
-const plugin = async ({ client }) => {
+const plugin = async ({ client, _searchByName } = {}) => {
+  // _searchByName: optional override for searchSessionsByNameViaSQLite (used in tests)
+  const resolveByName = _searchByName ?? searchSessionsByNameViaSQLite
   return {
     tool: {
       session_reflection: tool({
@@ -73,11 +79,18 @@ const plugin = async ({ client }) => {
             const session = res && typeof res === "object" && "data" in res ? res.data : res
             if (!session || session.error) return `No session found: ${args.sessionID}`
             selected = [session]
+          } else if (requestedSessionName) {
+            // Try cross-project SQLite search first; fall back to API-based search
+            const sqliteResults = await resolveByName(requestedSessionName)
+            if (sqliteResults !== null) {
+              selected = sqliteResults
+            } else {
+              const sessions = await listSessionsPaged(client._client)
+              selected = selectSessionsByName(sessions, requestedSessionName)
+            }
           } else {
             const sessions = await listSessionsPaged(client._client)
-            selected = requestedSessionName
-              ? selectSessionsByName(sessions, requestedSessionName)
-              : selectSessionsForReview(sessions, { limit: args.limit })
+            selected = selectSessionsForReview(sessions, { limit: args.limit })
           }
 
           if (selected.length === 0) {
@@ -220,4 +233,51 @@ async function listSessionsPaged(rawClient, { pageSize = 200 } = {}) {
     start += pageSize
   }
   return all
+}
+
+/**
+ * Search sessions by title across ALL projects using the OpenCode SQLite database.
+ *
+ * This bypasses the API's project-scoped filtering by querying the SQLite DB
+ * directly via the `sqlite3` CLI. Returns sessions whose title contains the
+ * query string (case-insensitive LIKE), sorted by time_updated descending.
+ *
+ * Returns null if the DB cannot be found or `sqlite3` is not available on PATH,
+ * allowing callers to fall back to the API-based search.
+ *
+ * @param {string} sessionName - title substring to search for
+ * @param {string} [dbPath] - override DB path (for testing)
+ * @returns {Promise<Array|null>} matching session objects, or null on failure
+ */
+async function searchSessionsByNameViaSQLite(sessionName, dbPath) {
+  const resolvedDbPath = dbPath ?? join(homedir(), ".local", "share", "opencode", "opencode.db")
+
+  try {
+    await access(resolvedDbPath)
+  } catch {
+    return null
+  }
+
+  // Escape single quotes in the search term to prevent SQL injection via LIKE
+  const escaped = sessionName.replace(/'/g, "''")
+  const sql = [
+    "SELECT id, title, directory, time_created, time_updated",
+    "FROM session",
+    `WHERE title LIKE '%${escaped}%'`,
+    "ORDER BY time_updated DESC",
+    "LIMIT 50;",
+  ].join(" ")
+
+  try {
+    const { stdout } = await execFileAsync("sqlite3", ["-separator", "\t", resolvedDbPath, sql], {
+      timeout: 5000,
+    })
+    const rows = stdout.trim().split("\n").filter(Boolean)
+    return rows.map((row) => {
+      const [id, title, directory, time_created, time_updated] = row.split("\t")
+      return { id, title, directory, time_created: Number(time_created), time_updated: Number(time_updated) }
+    })
+  } catch {
+    return null
+  }
 }

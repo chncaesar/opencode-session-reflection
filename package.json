@@ -1,6 +1,6 @@
 {
   "name": "opencode-session-reflection",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "description": "OpenCode plugin for qualitative session reflection and open-source workflow opportunity discovery.",
   "type": "module",
   "main": "./src/index.js",

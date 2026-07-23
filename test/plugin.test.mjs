@@ -64,7 +64,8 @@ test("session_reflection asks for confirmation when sessionName matches multiple
     ses_1: [{ info: { role: "user", time_created: 1 }, parts: [{ type: "text", text: "message for ses_1" }] }],
     ses_2: [{ info: { role: "user", time_created: 1 }, parts: [{ type: "text", text: "message for ses_2" }] }],
   }
-  const hooks = await plugin({ client: makeClient(sessions, messages) })
+  // Force fallback to API-based search so the mock sessions are used
+  const hooks = await plugin({ client: makeClient(sessions, messages), _searchByName: async () => null })
 
   const result = await hooks.tool.session_reflection.execute(
     { action: "collect", sessionName: "npm whoami ENEEDAUTH 排查", limit: 8 },
@@ -146,4 +147,57 @@ test("session_reflection pages through all sessions when list exceeds one page",
   for (const s of sessions) {
     assert.match(result.output, new RegExp(s.id))
   }
+})
+
+test("session_reflection uses SQLite results when _searchByName returns sessions", async () => {
+  const sqliteSessions = [
+    { id: "ses_sqlite_1", title: "data-platform ETL fix", directory: "/work/code/data-platform", time_updated: 100 },
+  ]
+  const messages = {
+    ses_sqlite_1: [
+      { info: { role: "user", time_created: 1 }, parts: [{ type: "text", text: "fix the ETL pipeline" }] },
+    ],
+  }
+  // _client list returns nothing (different project), but SQLite mock returns a cross-project hit
+  const client = {
+    _client: { async get() { return { data: [] } } },
+    session: {
+      async get({ path }) {
+        const s = sqliteSessions.find((s) => s.id === path.id)
+        if (!s) throw new Error(`not found: ${path.id}`)
+        return { data: s }
+      },
+      async messages({ path }) {
+        return { data: messages[path.id] ?? [] }
+      },
+    },
+  }
+
+  const hooks = await plugin({ client, _searchByName: async () => sqliteSessions })
+  const result = await hooks.tool.session_reflection.execute(
+    { action: "collect", sessionName: "data-platform" },
+    { agent: "test-agent" },
+  )
+
+  assert.ok(result.output?.includes("Run ID:"), "should produce a reflection prompt via SQLite path")
+  assert.match(result.output, /ses_sqlite_1/)
+})
+
+test("session_reflection falls back to API search when _searchByName returns null", async () => {
+  const sessions = [
+    { id: "ses_api_1", title: "law-agent refactor", time_updated: 5 },
+  ]
+  const messages = {
+    ses_api_1: [
+      { info: { role: "user", time_created: 1 }, parts: [{ type: "text", text: "refactor the law agent" }] },
+    ],
+  }
+  const hooks = await plugin({ client: makeClient(sessions, messages), _searchByName: async () => null })
+  const result = await hooks.tool.session_reflection.execute(
+    { action: "collect", sessionName: "law-agent" },
+    { agent: "test-agent" },
+  )
+
+  assert.ok(result.output?.includes("Run ID:"), "should produce a reflection prompt via API fallback")
+  assert.match(result.output, /ses_api_1/)
 })
