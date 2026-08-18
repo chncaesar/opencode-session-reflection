@@ -4,14 +4,16 @@ const MAX_TEXT_CHARS = 1800
 const MAX_TRANSCRIPT_ITEMS = 80
 const MAX_CANDIDATE_PREVIEW_ITEMS = 3
 const MAX_CANDIDATE_PREVIEW_CHARS = 160
+export const MAX_EVIDENCE_CHARS = 48_000
+const SESSION_SEPARATOR = "\n\n---\n\n"
 
 export function selectSessionsForReview(sessions, options = {}) {
   const limit = Math.max(1, Number(options.limit ?? DEFAULT_LIMIT))
   const since = options.since ? Number(options.since) : undefined
 
   return [...sessions]
-    .filter((session) => !since || Number(session.time_updated ?? 0) >= since)
-    .sort((a, b) => Number(b.time_updated ?? 0) - Number(a.time_updated ?? 0))
+    .filter((session) => !since || getSessionUpdatedTime(session) >= since)
+    .sort((a, b) => getSessionUpdatedTime(b) - getSessionUpdatedTime(a))
     .slice(0, limit)
 }
 
@@ -34,7 +36,7 @@ export function formatSessionCandidatesForConfirmation({ sessionName, candidates
     lines.push("")
     lines.push(`${index + 1}. sessionID: ${session.id}`)
     lines.push(`   title: ${session.title || "(untitled)"}`)
-    lines.push(`   time_updated: ${session.time_updated ?? "(unknown)"}`)
+    lines.push(`   time_updated: ${getSessionUpdatedTime(session) || "(unknown)"}`)
 
     const preview = buildCandidatePreview(transcript)
     if (preview.length === 0) {
@@ -56,14 +58,18 @@ export function extractTranscript(messages) {
     .map((message) => {
       const info = message.info ?? {}
       const role = String(info.role ?? "unknown")
-      const parts = message.parts ?? []
+      const parts = (message.parts ?? []).filter((part) => !isExcludedPart(part))
       const text = parts
+        .filter((part) => part?.type === "text")
         .map(extractPartText)
         .map((partText) => filterTranscriptText(partText, role))
         .filter(Boolean)
         .join("\n")
         .trim()
-      const tools = parts.map(extractToolLabel).filter(Boolean)
+      const tools = parts
+        .filter((part) => part?.type === "tool")
+        .map(extractToolLabel)
+        .filter(Boolean)
 
       if (!text && tools.length === 0) return undefined
 
@@ -71,15 +77,22 @@ export function extractTranscript(messages) {
         role,
         text: truncate(text, MAX_TEXT_CHARS),
         tools,
-        timestamp: info.time_created,
+        timestamp: info.time?.created ?? info.time_created,
       }
     })
     .filter(Boolean)
     .slice(-MAX_TRANSCRIPT_ITEMS)
 }
 
-export function buildReflectionPrompt({ sessions }) {
-  const sessionBlocks = sessions.map(formatSessionForPrompt).join("\n\n---\n\n")
+export function buildReflectionPrompt({ sessions, maxEvidenceChars = MAX_EVIDENCE_CHARS }) {
+  const separatorBudget = Math.max(0, sessions.length - 1) * SESSION_SEPARATOR.length
+  const availableBudget = Math.max(0, maxEvidenceChars - separatorBudget)
+  const baseAllocation = sessions.length ? Math.floor(availableBudget / sessions.length) : 0
+  let allocationRemainder = sessions.length ? availableBudget % sessions.length : 0
+  const sessionBlocks = sessions.map((session) => {
+    const allocation = baseAllocation + (allocationRemainder-- > 0 ? 1 : 0)
+    return formatSessionForPrompt(session, allocation)
+  }).join(SESSION_SEPARATOR)
 
   return `You are a strict, pragmatic OpenCode session-review analyst. Analyze only the session evidence below. Do not invent patterns that are not supported by the transcript.
 
@@ -148,33 +161,44 @@ Session evidence:
 ${sessionBlocks}`
 }
 
-export function formatReflectionReport({ reviewedSessionCount, model, analysis }) {
+export function formatReflectionReport({ runId, reviewedSessionCount, agent, analysis }) {
   const now = new Date().toISOString()
 
   return `# OpenCode Session Reflection
 
 - Generated: ${now}
+- Run ID: ${runId}
 - Reviewed sessions: ${reviewedSessionCount}
-- Model: ${model || "current opencode model"}
+- Agent: ${agent || "current opencode agent"}
 
 ${analysis.trim()}
 `
 }
 
-function formatSessionForPrompt(session) {
+function formatSessionForPrompt(session, maxChars) {
   const lines = [
     `session_id: ${session.id}`,
-    `title: ${session.title || "(untitled)"}`,
-    `directory: ${session.directory || "(unknown)"}`,
+    `title: ${truncate(session.title || "(untitled)", 300)}`,
+    `directory: ${truncate(session.directory || "(unknown)", 500)}`,
   ]
+  let block = lines.join("\n").slice(0, maxChars)
+  const transcript = session.transcript ?? []
 
-  for (const item of session.transcript ?? []) {
+  for (let index = 0; index < transcript.length; index += 1) {
+    const item = transcript[index]
     const tools = item.tools.length ? `\n  tools: ${item.tools.join(", ")}` : ""
     const text = item.text ? `\n  text: ${item.text}` : ""
-    lines.push(`- ${item.role}:${text}${tools}`)
+    const itemBlock = `\n- ${item.role}:${text}${tools}`
+    const omittedCount = transcript.length - index
+    const marker = `\n[omitted ${omittedCount} transcript items due to evidence budget]`
+    if (block.length + itemBlock.length + (index < transcript.length - 1 ? marker.length : 0) > maxChars) {
+      if (block.length + marker.length <= maxChars) block += marker
+      break
+    }
+    block += itemBlock
   }
 
-  return lines.join("\n")
+  return block
 }
 
 function extractPartText(part) {
@@ -184,6 +208,17 @@ function extractPartText(part) {
   if (part.type === "text" && typeof part.data?.text === "string") return part.data.text
   if (typeof part.data?.text === "string") return part.data.text
   return ""
+}
+
+function isExcludedPart(part) {
+  if (!part || typeof part !== "object") return true
+  return Boolean(
+    part.ignored ||
+    part.synthetic ||
+    part.type === "reasoning" ||
+    part.metadata?.ignored ||
+    part.metadata?.synthetic
+  )
 }
 
 function filterTranscriptText(text, role) {
@@ -218,6 +253,10 @@ function truncate(value, maxChars) {
 
 function normalizeSessionTitle(value) {
   return String(value ?? "").trim().toLowerCase()
+}
+
+function getSessionUpdatedTime(session) {
+  return Number(session?.time?.updated ?? session?.time_updated ?? 0)
 }
 
 function buildCandidatePreview(transcript) {

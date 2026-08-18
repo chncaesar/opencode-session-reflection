@@ -1,9 +1,6 @@
 // Tested by test/plugin.test.mjs; core behavior is covered by test/core.test.mjs.
-import { execFile } from "node:child_process"
-import { access, mkdir, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
-import { join } from "node:path"
-import { promisify } from "node:util"
+import { isAbsolute, join } from "node:path"
 import { tool } from "@opencode-ai/plugin"
 
 import {
@@ -11,25 +8,24 @@ import {
   extractTranscript,
   formatSessionCandidatesForConfirmation,
   formatReflectionReport,
+  MAX_EVIDENCE_CHARS,
   selectSessionsByName,
   selectSessionsForReview,
 } from "./core.js"
 import {
   appendRunEvent,
-  attachReportToRun,
   buildRunManifest,
   createRunId,
+  saveReportForRun,
   writeRunManifest,
 } from "./logging.js"
 
-const execFileAsync = promisify(execFile)
+const DEFAULT_MAX_SESSION_PAGES = 100
+const SAVE_AUDIT_WARNING = "The report was saved, but its audit event could not be recorded."
+const EVIDENCE_BUDGET_ENV = "SESSION_REFLECTION_EVIDENCE_BUDGET"
 
-const LOG_DIR = join(homedir(), ".config", "opencode", "session-reflections")
-const REPORT_DIR = join(LOG_DIR, "reports")
-
-const plugin = async ({ client, _searchByName } = {}) => {
-  // _searchByName: optional override for searchSessionsByNameViaSQLite (used in tests)
-  const resolveByName = _searchByName ?? searchSessionsByNameViaSQLite
+const plugin = async ({ client, _logDir } = {}) => {
+  const logDir = _logDir ?? resolveLogDir()
   return {
     tool: {
       session_reflection: tool({
@@ -38,6 +34,7 @@ const plugin = async ({ client, _searchByName } = {}) => {
         args: {
           action: tool.schema.enum(["collect", "save"]).default("collect"),
           limit: tool.schema.number().int().min(1).max(30).default(8),
+          evidenceBudget: tool.schema.number().int().min(1).optional(),
           sessionID: tool.schema.string().optional(),
           sessionName: tool.schema.string().optional(),
           runID: tool.schema.string().optional(),
@@ -48,26 +45,37 @@ const plugin = async ({ client, _searchByName } = {}) => {
             if (!args.analysis?.trim()) {
               return "Save failed: analysis must not be empty."
             }
+            if (!args.runID) {
+              return "Save failed: runID is required. Collect sessions before saving a report."
+            }
 
-            const report = formatReflectionReport({
-              reviewedSessionCount: 0,
-              model: context.agent,
-              analysis: args.analysis,
-            })
-            const { absolutePath, relativePath } = await writeReport(report)
-
-            if (args.runID) {
-              await attachReportToRun(LOG_DIR, args.runID, relativePath)
-              await appendRunEvent(LOG_DIR, {
+            const { absolutePath, relativePath } = await saveReportForRun(
+              logDir,
+              args.runID,
+              (manifest) => formatReflectionReport({
+                runId: manifest.runId,
+                reviewedSessionCount: manifest.selectedSessions.length,
+                agent: context.agent,
+                analysis: args.analysis,
+              }),
+            )
+            let auditWarning
+            try {
+              await appendRunEvent(logDir, {
                 type: "save",
                 runId: args.runID,
                 reportPath: relativePath,
               })
+            } catch {
+              auditWarning = SAVE_AUDIT_WARNING
             }
 
             return {
               title: "Session reflection saved",
-              output: `Saved reflection report: ${absolutePath}`,
+              output: auditWarning
+                ? `Saved reflection report: ${absolutePath}\nWarning: ${auditWarning}`
+                : `Saved reflection report: ${absolutePath}`,
+              ...(auditWarning ? { metadata: { auditWarning } } : {}),
             }
           }
 
@@ -80,17 +88,11 @@ const plugin = async ({ client, _searchByName } = {}) => {
             if (!session || session.error) return `No session found: ${args.sessionID}`
             selected = [session]
           } else if (requestedSessionName) {
-            // Try cross-project SQLite search first; fall back to API-based search
-            const sqliteResults = await resolveByName(requestedSessionName)
-            if (sqliteResults !== null) {
-              selected = sqliteResults
-            } else {
-              const sessions = await listSessionsPaged(client._client)
-              selected = selectSessionsByName(sessions, requestedSessionName)
-            }
+            const sessions = await listSessionsPaged(client._client, { search: requestedSessionName })
+            selected = selectSessionsByName(excludeCurrentSession(sessions, context.sessionID), requestedSessionName)
           } else {
             const sessions = await listSessionsPaged(client._client)
-            selected = selectSessionsForReview(sessions, { limit: args.limit })
+            selected = selectSessionsForReview(excludeCurrentSession(sessions, context.sessionID), { limit: args.limit })
           }
 
           if (selected.length === 0) {
@@ -148,7 +150,10 @@ const plugin = async ({ client, _searchByName } = {}) => {
             return "No reviewable OpenCode sessions found for reflection."
           }
 
-          const prompt = buildReflectionPrompt({ sessions: enriched })
+          const prompt = buildReflectionPrompt({
+            sessions: enriched,
+            maxEvidenceChars: resolveEvidenceBudget(args.evidenceBudget),
+          })
           const manifest = buildRunManifest({
             runId,
             startedAt,
@@ -161,8 +166,8 @@ const plugin = async ({ client, _searchByName } = {}) => {
             errors: [],
           })
 
-          await writeRunManifest(LOG_DIR, manifest)
-          await appendRunEvent(LOG_DIR, {
+          await writeRunManifest(logDir, manifest)
+          await appendRunEvent(logDir, {
             type: "collect",
             runId,
             sessionCount: enriched.length,
@@ -186,15 +191,6 @@ const plugin = async ({ client, _searchByName } = {}) => {
 
 export default plugin
 
-async function writeReport(report) {
-  await mkdir(REPORT_DIR, { recursive: true })
-  const stamp = new Date().toISOString().replace(/[:.]/g, "-")
-  const filename = `${stamp}.md`
-  const absolutePath = join(REPORT_DIR, filename)
-  await writeFile(absolutePath, report, "utf8")
-  return { absolutePath, relativePath: join("reports", filename) }
-}
-
 function unwrapSdkArray(response, label) {
   const data = response && typeof response === "object" && "data" in response ? response.data : response
   if (!Array.isArray(data)) {
@@ -204,7 +200,7 @@ function unwrapSdkArray(response, label) {
 }
 
 /**
- * Fetch all sessions by paging through GET /session.
+ * Fetch all sessions by paging through GET /experimental/session.
  *
  * The SDK client interceptor auto-injects `?directory=<cwd>` on every request,
  * which causes the server to filter sessions to the current workspace only.
@@ -215,69 +211,71 @@ function unwrapSdkArray(response, label) {
  * Session name / title search is done client-side via selectSessionsByName.
  *
  * @param {object} rawClient - client._client from the plugin context
- * @param {number} [opts.pageSize] - sessions per request (default 200)
+ * @param {number} [options.pageSize] - sessions per request (default 200)
  */
-async function listSessionsPaged(rawClient, { pageSize = 200 } = {}) {
+export async function listSessionsPaged(
+  rawClient,
+  { pageSize = 200, maxPages = DEFAULT_MAX_SESSION_PAGES, search } = {},
+) {
   const headers = { "x-opencode-directory": "" }
+  const sessionsById = new Map()
+  const seenCursors = new Set()
+  let cursor
 
-  const all = []
-  let start = 0
-  while (true) {
-    const query = { limit: pageSize, start }
-    const res = await rawClient.get({ url: "/session", query, headers })
-    if (res?.error) throw new Error(`GET /session failed: ${JSON.stringify(res.error)}`)
-    const page = Array.isArray(res?.data) ? res.data : []
-    if (page.length === 0) break
-    all.push(...page)
-    if (page.length < pageSize) break
-    start += pageSize
+  for (let pageNumber = 0; pageNumber < maxPages; pageNumber += 1) {
+    const query = { limit: pageSize }
+    if (cursor) query.cursor = cursor
+    if (search) query.search = search
+    const res = await rawClient.get({ url: "/experimental/session", query, headers })
+    if (res?.error) throw stableSessionListError()
+    if (!Array.isArray(res?.data)) {
+      throw stableSessionListError()
+    }
+    for (const session of res.data) {
+      if (session?.id && !sessionsById.has(session.id)) sessionsById.set(session.id, session)
+    }
+
+    const nextCursor = readNextCursor(res)
+    if (!nextCursor) return [...sessionsById.values()]
+    const cursorKey = String(nextCursor)
+    if (seenCursors.has(cursorKey)) {
+      throw new Error(`GET /experimental/session returned a repeated cursor: ${nextCursor}`)
+    }
+    seenCursors.add(cursorKey)
+    cursor = nextCursor
   }
-  return all
+
+  throw new Error(`GET /experimental/session exceeded ${maxPages} pages`)
 }
 
-/**
- * Search sessions by title across ALL projects using the OpenCode SQLite database.
- *
- * This bypasses the API's project-scoped filtering by querying the SQLite DB
- * directly via the `sqlite3` CLI. Returns sessions whose title contains the
- * query string (case-insensitive LIKE), sorted by time_updated descending.
- *
- * Returns null if the DB cannot be found or `sqlite3` is not available on PATH,
- * allowing callers to fall back to the API-based search.
- *
- * @param {string} sessionName - title substring to search for
- * @param {string} [dbPath] - override DB path (for testing)
- * @returns {Promise<Array|null>} matching session objects, or null on failure
- */
-async function searchSessionsByNameViaSQLite(sessionName, dbPath) {
-  const resolvedDbPath = dbPath ?? join(homedir(), ".local", "share", "opencode", "opencode.db")
+function readNextCursor(response) {
+  const headers = response?.response?.headers ?? response?.headers
+  if (typeof headers?.get === "function") return headers.get("x-next-cursor") || undefined
+  return headers?.["x-next-cursor"] ?? headers?.["X-Next-Cursor"]
+}
 
-  try {
-    await access(resolvedDbPath)
-  } catch {
-    return null
-  }
+function excludeCurrentSession(sessions, currentSessionId) {
+  if (!currentSessionId) return sessions
+  return sessions.filter((session) => session.id !== currentSessionId)
+}
 
-  // Escape single quotes in the search term to prevent SQL injection via LIKE
-  const escaped = sessionName.replace(/'/g, "''")
-  const sql = [
-    "SELECT id, title, directory, time_created, time_updated",
-    "FROM session",
-    `WHERE title LIKE '%${escaped}%'`,
-    "ORDER BY time_updated DESC",
-    "LIMIT 50;",
-  ].join(" ")
+export function resolveLogDir() {
+  const xdgConfigRoot = process.env.XDG_CONFIG_HOME
+  const configRoot = xdgConfigRoot && isAbsolute(xdgConfigRoot)
+    ? xdgConfigRoot
+    : join(homedir(), ".config")
+  return join(configRoot, "opencode", "session-reflections")
+}
 
-  try {
-    const { stdout } = await execFileAsync("sqlite3", ["-separator", "\t", resolvedDbPath, sql], {
-      timeout: 5000,
-    })
-    const rows = stdout.trim().split("\n").filter(Boolean)
-    return rows.map((row) => {
-      const [id, title, directory, time_created, time_updated] = row.split("\t")
-      return { id, title, directory, time_created: Number(time_created), time_updated: Number(time_updated) }
-    })
-  } catch {
-    return null
-  }
+function stableSessionListError() {
+  return new Error("Could not load OpenCode sessions. Please try again.")
+}
+
+function resolveEvidenceBudget(argValue) {
+  if (Number.isInteger(argValue) && argValue > 0) return argValue
+
+  const envValue = Number.parseInt(process.env[EVIDENCE_BUDGET_ENV], 10)
+  if (Number.isInteger(envValue) && envValue > 0) return envValue
+
+  return MAX_EVIDENCE_CHARS
 }

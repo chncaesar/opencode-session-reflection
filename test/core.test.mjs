@@ -71,6 +71,19 @@ test("selectSessionsForReview sorts recent sessions and respects limit", () => {
   )
 })
 
+test("session selection accepts nested and flattened updated timestamps", () => {
+  const sessions = [
+    { id: "flat", time_updated: 2 },
+    { id: "nested", time: { updated: 3 } },
+    { id: "old", time: { updated: 1 } },
+  ]
+
+  assert.deepEqual(
+    selectSessionsForReview(sessions, { limit: 2, since: 2 }).map((session) => session.id),
+    ["nested", "flat"],
+  )
+})
+
 test("selectSessionsByName prefers exact title matches before contains fallback", () => {
   const sessions = [
     { id: "contains", title: "npm whoami ENEEDAUTH 排查 follow-up" },
@@ -158,16 +171,99 @@ test("buildReflectionPrompt asks for English-only feasibility and value analysis
   assert.match(prompt, /session_id: s1/)
 })
 
+test("extractTranscript accepts nested timestamps and filters ignored, synthetic, and reasoning parts", () => {
+  const transcript = extractTranscript([
+    {
+      info: { role: "assistant", time: { created: 42 } },
+      parts: [
+        { type: "text", text: "kept text" },
+        { type: "text", text: "ignored text", ignored: true },
+        { type: "text", text: "synthetic text", synthetic: true },
+        { type: "reasoning", text: "private reasoning" },
+        { type: "tool", tool: "read", state: { status: "completed" }, ignored: true },
+        { type: "tool", tool: "grep", state: { status: "completed" } },
+      ],
+    },
+  ])
+
+  assert.deepEqual(transcript, [
+    { role: "assistant", text: "kept text", tools: ["grep:completed"], timestamp: 42 },
+  ])
+})
+
+test("buildReflectionPrompt fairly bounds evidence and marks omitted transcript items", () => {
+  const sessions = Array.from({ length: 12 }, (_, sessionIndex) => ({
+    id: `session-${sessionIndex}`,
+    title: `Title ${sessionIndex}`,
+    directory: `/private/repo/${sessionIndex}`,
+    transcript: Array.from({ length: 30 }, (_, itemIndex) => ({
+      role: itemIndex % 2 === 0 ? "user" : "assistant",
+      text: `${sessionIndex}-${itemIndex}-${"x".repeat(1700)}`,
+      tools: [],
+      timestamp: itemIndex,
+    })),
+  }))
+
+  const prompt = buildReflectionPrompt({ sessions })
+  const evidence = prompt.split("Session evidence:\n\n")[1]
+
+  assert.ok(evidence.length <= 48_000, `evidence was ${evidence.length} characters`)
+  for (const session of sessions) assert.match(evidence, new RegExp(`session_id: ${session.id}`))
+  assert.match(evidence, /\[omitted \d+ transcript items due to evidence budget\]/)
+})
+
+test("buildReflectionPrompt honors a custom maxEvidenceChars budget", () => {
+  const sessions = Array.from({ length: 2 }, (_, sessionIndex) => ({
+    id: `session-${sessionIndex}`,
+    title: `Title ${sessionIndex}`,
+    directory: `/repo/${sessionIndex}`,
+    transcript: Array.from({ length: 20 }, (_, itemIndex) => ({
+      role: itemIndex % 2 === 0 ? "user" : "assistant",
+      text: `${sessionIndex}-${itemIndex}-${"x".repeat(500)}`,
+      tools: [],
+      timestamp: itemIndex,
+    })),
+  }))
+
+  const prompt = buildReflectionPrompt({ sessions, maxEvidenceChars: 2_000 })
+  const evidence = prompt.split("Session evidence:\n\n")[1]
+
+  assert.ok(evidence.length <= 2_000, `evidence was ${evidence.length} characters`)
+  for (const session of sessions) assert.match(evidence, new RegExp(`session_id: ${session.id}`))
+  assert.match(evidence, /\[omitted \d+ transcript items due to evidence budget\]/)
+})
+
+test("buildReflectionPrompt falls back to the default budget when none is provided", () => {
+  const sessions = Array.from({ length: 12 }, (_, sessionIndex) => ({
+    id: `session-${sessionIndex}`,
+    title: `Title ${sessionIndex}`,
+    directory: `/repo/${sessionIndex}`,
+    transcript: Array.from({ length: 30 }, (_, itemIndex) => ({
+      role: itemIndex % 2 === 0 ? "user" : "assistant",
+      text: `${sessionIndex}-${itemIndex}-${"x".repeat(1700)}`,
+      tools: [],
+      timestamp: itemIndex,
+    })),
+  }))
+
+  const prompt = buildReflectionPrompt({ sessions })
+  const evidence = prompt.split("Session evidence:\n\n")[1]
+
+  assert.ok(evidence.length <= 48_000, `evidence was ${evidence.length} characters`)
+})
+
 test("formatReflectionReport renders stable markdown sections", () => {
   const report = formatReflectionReport({
+    runId: "2026-07-11T00-00-00-000Z-report000001",
     reviewedSessionCount: 2,
-    model: "openai/gpt-5.5",
+    agent: "review-agent",
     analysis: "### 1. Developer-to-agent communication gaps\n- Missing acceptance criteria",
   })
 
   assert.doesNotMatch(report, /[\p{Script=Han}]/u)
   assert.match(report, /^# OpenCode Session Reflection/m)
+  assert.match(report, /Run ID: 2026-07-11T00-00-00-000Z-report000001/)
   assert.match(report, /Reviewed sessions: 2/)
-  assert.match(report, /Model: openai\/gpt-5\.5/)
+  assert.match(report, /Agent: review-agent/)
   assert.match(report, /Missing acceptance criteria/)
 })

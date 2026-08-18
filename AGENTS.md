@@ -71,6 +71,7 @@ Before publishing, run:
 ```sh
 npm test
 npm run check:import
+npm audit --omit=dev
 npm pack --dry-run
 npm pack
 ```
@@ -128,35 +129,64 @@ remove them before the post-publish smoke to avoid double-loading the plugin.
 |------|----------------|---------------------|
 | `index.js` | Tool registration, arg validation, SDK calls, orchestration | Analysis logic, file I/O details |
 | `core.js` | Session selection, transcript extraction, prompt/report formatting | SDK calls, file I/O |
-| `logging.js` | Writing manifests, events, reports to disk | SDK calls, analysis |
+| `logging.js` | Validating run IDs and reading/writing private manifests, immutable report/sidecar pairs, and event logs | SDK calls, analysis |
 
-Keep SDK calls (`client.*`, `_client.*`) in `index.js` only. `core.js` and `logging.js` must be pure functions with no external I/O dependencies so they remain unit-testable without mocks.
+Keep SDK calls (`client.*`, `_client.*`) in `index.js` only. `core.js` remains pure. `logging.js` deliberately performs filesystem I/O, with paths supplied by callers so tests can isolate it in temporary directories.
 
 ## SDK Quirks
 
-### Session list is filtered by workspace directory
+### Session listing uses the experimental cursor endpoint
+
+Session discovery calls `GET /experimental/session` through `_client.get()`.
+It follows the `x-next-cursor` response header, deduplicates session IDs, and
+rejects repeated cursors or more than 100 pages. Name lookup sends the endpoint
+`search` query. Explicit `sessionID` lookup still uses `client.session.get()`.
 
 The SDK client interceptor automatically injects `?directory=<cwd>` on every
-request, so `client.session.list()` only returns sessions from the current
-workspace. To search across all workspaces:
+request, which would restrict discovery to the current workspace. To search
+across all workspaces:
 
 - Pass `headers: { "x-opencode-directory": "" }` to `_client.get()`. An empty
   string is falsy in the interceptor's `pick()` function, so injection is skipped
   and the server returns all sessions.
-- This is implemented in `listSessionsPaged()` in `src/index.js`.
-
-### SessionListData type is incomplete
-
-`client.session.list()` only exposes `directory` in its TypeScript type, but the
-server accepts `limit`, `start`, and `search`. The plugin calls `_client.get()`
-directly with these parameters to bypass the type restriction. If the SDK type is
-updated in a future version, `listSessionsPaged` can be simplified to use
-`client.session.list()`.
+- `listSessionsPaged()` in `src/index.js` applies this header on every cursor
+  request.
 
 ### sessionID lookup bypasses the list
 
 Use `client.session.get({ path: { id } })` when a specific session id is known.
 This avoids the list entirely and works regardless of session age.
+
+## Evidence And Local Privacy
+
+- Reflection prompts enforce a global 48,000-character session-evidence budget by
+  default. The budget is overridable per call via the `evidenceBudget` tool arg or
+  persistently via the `SESSION_REFLECTION_EVIDENCE_BUDGET` environment variable.
+  Keep the default bound when changing transcript extraction or prompt formatting.
+- Audit data is stored under `${XDG_CONFIG_HOME}/opencode/session-reflections/`
+  only when `XDG_CONFIG_HOME` is absolute; unset, empty, and relative values fall
+  back to `~/.config/opencode/session-reflections/`.
+- Directories must remain owner-only (`0700`), and manifests, event logs,
+  reports, and report sidecars must remain owner-only (`0600`).
+- Manifests contain metadata and hashes, not session titles or transcript text.
+- New manifests are immutable collect snapshots. `readRunManifest` must continue
+  to accept legacy `0.2` manifests that contain mutable report fields, but new
+  code must not add or update those fields.
+- A save action must validate its generated run ID and matching manifest before
+  creating the reports directory or writing a report.
+- Reject symbolic links at the `runs`, `reports`, and manifest-target boundaries.
+  Event appends must also reject non-regular and hard-linked targets and verify
+  that the opened file is the file inspected by path.
+- Every save reads one validated manifest snapshot, builds the report from that
+  exact snapshot, and exclusively publishes a globally unique immutable report
+  plus same-base-name JSON sidecar. The sidecar owns report-to-run linkage and
+  records the manifest-snapshot hash; saving never mutates the collect manifest.
+- Publication must fully write and permission a private temporary file before an
+  exclusive operation that cannot overwrite an existing target. Revalidate the
+  canonical child directory immediately before publication, and never chmod a
+  published file by pathname.
+- Concurrent saves, including saves from separate processes, use distinct
+  report/sidecar pairs without process-local locks or shared mutable state.
 
 ### Response unwrapping
 
@@ -191,3 +221,6 @@ All tests use `node --test` with no external test framework.
 
 Run `npm test` before every `npm run deploy`. Do not deploy with failing tests.
 Before npm publishing, also run `npm run check:import` and `npm pack --dry-run`.
+Compatibility CI runs the full release checks on Node 20 and 22 against both
+`@opencode-ai/plugin@1.17.11` and `@opencode-ai/plugin@latest`; dependency
+overrides must not mutate `package.json` or `package-lock.json`.
