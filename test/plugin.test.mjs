@@ -4,7 +4,10 @@ import { homedir, tmpdir } from "node:os"
 import { join } from "node:path"
 import test from "node:test"
 
-import plugin, { resolveLogDir } from "../src/index.js"
+import pluginModule from "../src/index.js"
+import { resolveLogDir } from "../src/logging.js"
+
+const plugin = pluginModule.server
 
 const pluginSource = new URL("../src/index.js", import.meta.url)
 
@@ -13,8 +16,12 @@ test("session-reflection plugin exposes the expected tool contract", async () =>
 
   assert.match(source, /session_reflection/)
   assert.match(source, /enum\(\["collect", "save"\]\)/)
+  assert.match(source, /id: "opencode-session-reflection"/)
+  assert.match(source, /server: plugin/)
   assert.match(source, /runID/)
   assert.match(source, /sessionName/)
+  assert.match(source, /period/)
+  assert.match(source, /since/)
   assert.match(source, /selectSessionsByName/)
   assert.match(source, /formatSessionCandidatesForConfirmation/)
   assert.match(source, /createRunId/)
@@ -383,6 +390,70 @@ test("session_reflection reads evidence budget from SESSION_REFLECTION_EVIDENCE_
     if (previousBudget === undefined) delete process.env.SESSION_REFLECTION_EVIDENCE_BUDGET
     else process.env.SESSION_REFLECTION_EVIDENCE_BUDGET = previousBudget
   }
+})
+
+test("session_reflection filters implicit selection by period", async () => {
+  const sessions = [
+    { id: "recent", title: "recent", time_updated: Date.now() },
+    { id: "old", title: "old", time_updated: 1 },
+  ]
+  const messages = {
+    recent: [{ info: { role: "user", time_created: 1 }, parts: [{ type: "text", text: "recent content" }] }],
+    old: [{ info: { role: "user", time_created: 1 }, parts: [{ type: "text", text: "old content" }] }],
+  }
+  const hooks = await plugin({ client: makeClient(sessions, messages) })
+
+  const result = await hooks.tool.session_reflection.execute(
+    { action: "collect", limit: 8, period: "today" },
+    { agent: "test-agent" },
+  )
+
+  assert.ok(result.output?.includes("Run ID:"), "should produce a reflection prompt")
+  assert.match(result.output, /session_id: recent/)
+  assert.doesNotMatch(result.output, /session_id: old/)
+})
+
+test("session_reflection filters implicit selection by since date", async () => {
+  const sessions = [
+    { id: "recent", title: "recent", time_updated: Date.now() },
+    { id: "old", title: "old", time_updated: new Date("2019-01-01T00:00:00Z").getTime() },
+  ]
+  const messages = {
+    recent: [{ info: { role: "user", time_created: 1 }, parts: [{ type: "text", text: "recent content" }] }],
+    old: [{ info: { role: "user", time_created: 1 }, parts: [{ type: "text", text: "old content" }] }],
+  }
+  const hooks = await plugin({ client: makeClient(sessions, messages) })
+
+  const result = await hooks.tool.session_reflection.execute(
+    { action: "collect", limit: 8, since: "2020-01-01" },
+    { agent: "test-agent" },
+  )
+
+  assert.ok(result.output?.includes("Run ID:"), "should produce a reflection prompt")
+  assert.match(result.output, /session_id: recent/)
+  assert.doesNotMatch(result.output, /session_id: old/)
+})
+
+test("session_reflection rejects period and since together", async () => {
+  const hooks = await plugin({ client: makeClient([], {}) })
+
+  const result = await hooks.tool.session_reflection.execute(
+    { action: "collect", period: "today", since: "2020-01-01" },
+    { agent: "test-agent" },
+  )
+
+  assert.equal(result, "period and since are mutually exclusive. Choose one time filter.")
+})
+
+test("session_reflection rejects an invalid since value", async () => {
+  const hooks = await plugin({ client: makeClient([], {}) })
+
+  const result = await hooks.tool.session_reflection.execute(
+    { action: "collect", since: "not-a-date" },
+    { agent: "test-agent" },
+  )
+
+  assert.equal(result, "Invalid since value: not-a-date")
 })
 
 test("list endpoint errors are stable and do not expose response internals", async () => {

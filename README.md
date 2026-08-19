@@ -60,6 +60,14 @@ Review by session title:
 Call session_reflection with action=collect and sessionName="npm whoami ENEEDAUTH".
 ```
 
+Review sessions from a time range:
+
+```text
+Call session_reflection with action=collect and period="thisWeek".
+```
+
+`period` accepts `today`, `yesterday`, `last3days`, `last7days`, `last30days`, `thisWeek`, `lastWeek`, `thisMonth`, or `lastMonth`. `today`/`yesterday`/`this*`/`last*` are calendar-anchored in the local timezone; `lastNd` covers the last N calendar days including today; weeks start on Monday. Pass `since` with an ISO date or datetime (for example `"2026-08-10"`) instead of `period` for an arbitrary start. `period` and `since` are mutually exclusive and both only apply when neither `sessionID` nor `sessionName` is given.
+
 Save a generated report:
 
 ```text
@@ -137,6 +145,8 @@ Saved Markdown reports contain the supplied analysis and may include sensitive e
 - Replaced SQLite lookup and offset listing with OpenCode `1.17.11+` experimental cursor pagination.
 - Added nested/flattened timestamp compatibility, current-session exclusion, deduplication, and bounded evidence collection.
 - Required validated collect run IDs for report saving, immutable report sidecars, and hardened local audit permissions and redaction.
+- Added `period` (`today`, `yesterday`, `last3days`, `last7days`, `last30days`, `thisWeek`, `lastWeek`, `thisMonth`, `lastMonth`) and `since` (ISO date) time-range filters for session collection.
+- Migrated to the V1 plugin module format (`id` + `server`) so the plugin loads correctly on OpenCode `1.18.x`, where the legacy loader treated every exported function as a plugin.
 
 ### v0.2.0
 

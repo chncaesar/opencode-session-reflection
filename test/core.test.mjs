@@ -6,6 +6,8 @@ import {
   extractTranscript,
   formatSessionCandidatesForConfirmation,
   formatReflectionReport,
+  parseSinceDate,
+  resolvePeriodSince,
   selectSessionsByName,
   selectSessionsForReview,
 } from "../src/core.js"
@@ -81,6 +83,73 @@ test("session selection accepts nested and flattened updated timestamps", () => 
   assert.deepEqual(
     selectSessionsForReview(sessions, { limit: 2, since: 2 }).map((session) => session.id),
     ["nested", "flat"],
+  )
+})
+
+test("resolvePeriodSince maps periods to local calendar boundaries", () => {
+  const now = new Date(2026, 7, 18, 15, 30, 0)
+
+  assert.equal(resolvePeriodSince("today", now), new Date(2026, 7, 18).getTime())
+  assert.equal(resolvePeriodSince("yesterday", now), new Date(2026, 7, 17).getTime())
+  assert.equal(resolvePeriodSince("last3days", now), new Date(2026, 7, 16).getTime())
+  assert.equal(resolvePeriodSince("last7days", now), new Date(2026, 7, 12).getTime())
+  assert.equal(resolvePeriodSince("last30days", now), new Date(2026, 6, 20).getTime())
+  assert.equal(resolvePeriodSince("thisWeek", now), new Date(2026, 7, 17).getTime())
+  assert.equal(resolvePeriodSince("lastWeek", now), new Date(2026, 7, 10).getTime())
+  assert.equal(resolvePeriodSince("thisMonth", now), new Date(2026, 7, 1).getTime())
+  assert.equal(resolvePeriodSince("lastMonth", now), new Date(2026, 6, 1).getTime())
+})
+
+test("resolvePeriodSince anchors thisWeek to Monday even on Sunday", () => {
+  const sunday = new Date(2026, 7, 23, 8, 0, 0)
+
+  assert.equal(resolvePeriodSince("thisWeek", sunday), new Date(2026, 7, 17).getTime())
+})
+
+test("resolvePeriodSince rolls lastMonth across the year boundary", () => {
+  const january = new Date(2026, 0, 15, 12, 0, 0)
+
+  assert.equal(resolvePeriodSince("thisMonth", january), new Date(2026, 0, 1).getTime())
+  assert.equal(resolvePeriodSince("lastMonth", january), new Date(2025, 11, 1).getTime())
+})
+
+test("resolvePeriodSince normalizes case and whitespace and rejects unknown periods", () => {
+  const now = new Date(2026, 7, 18, 15, 30, 0)
+
+  assert.equal(resolvePeriodSince("  TODAY ", now), new Date(2026, 7, 18).getTime())
+  assert.equal(resolvePeriodSince("ThisWeek", now), new Date(2026, 7, 17).getTime())
+  assert.equal(resolvePeriodSince("bogus", now), undefined)
+  assert.equal(resolvePeriodSince("", now), undefined)
+  assert.equal(resolvePeriodSince(undefined, now), undefined)
+})
+
+test("parseSinceDate accepts date-only and full ISO datetime values", () => {
+  assert.equal(parseSinceDate("2026-08-10"), new Date(2026, 7, 10).getTime())
+  assert.equal(parseSinceDate("2026-08-10T00:00:00Z"), Date.parse("2026-08-10T00:00:00Z"))
+  assert.equal(parseSinceDate("2026-08-10T12:30:00+08:00"), Date.parse("2026-08-10T12:30:00+08:00"))
+})
+
+test("parseSinceDate rejects invalid dates and empty input", () => {
+  assert.throws(() => parseSinceDate("2026-02-30"), /Invalid since date/)
+  assert.throws(() => parseSinceDate("2026-13-01"), /Invalid since date/)
+  assert.throws(() => parseSinceDate("2026-02-30T00:00:00Z"), /Invalid since date/)
+  assert.throws(() => parseSinceDate("not-a-date"), /Invalid since value/)
+  assert.throws(() => parseSinceDate("08/10/2026"), /Invalid since value/)
+  assert.throws(() => parseSinceDate("2026-8-10"), /Invalid since value/)
+  assert.throws(() => parseSinceDate(""), /since must be an ISO date or datetime/)
+  assert.throws(() => parseSinceDate(undefined), /since must be an ISO date or datetime/)
+})
+
+test("selectSessionsForReview treats a zero since as a real boundary", () => {
+  const sessions = [
+    { id: "negative", time_updated: -5 },
+    { id: "zero", time_updated: 0 },
+    { id: "positive", time_updated: 5 },
+  ]
+
+  assert.deepEqual(
+    selectSessionsForReview(sessions, { limit: 10, since: 0 }).map((session) => session.id),
+    ["positive", "zero"],
   )
 })
 

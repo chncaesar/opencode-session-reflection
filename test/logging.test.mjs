@@ -39,6 +39,8 @@ test("buildRunManifest records metadata without raw transcript or directory path
     action: "collect",
     limit: 8,
     requestedSessionId: null,
+    period: "today",
+    since: 1234567890,
     selectedSessions: [
       {
         session: {
@@ -62,6 +64,8 @@ test("buildRunManifest records metadata without raw transcript or directory path
   const json = JSON.stringify(manifest)
 
   assert.equal(manifest.runId, makeRunId("manifest0001"))
+  assert.equal(manifest.period, "today")
+  assert.equal(manifest.since, 1234567890)
   assert.equal(manifest.selectedSessions[0].id, "ses_1")
   assert.equal(manifest.selectedSessions[0].messageCount, 2)
   assert.equal(manifest.selectedSessions[0].transcriptItemCount, 2)

@@ -9,10 +9,10 @@ const SESSION_SEPARATOR = "\n\n---\n\n"
 
 export function selectSessionsForReview(sessions, options = {}) {
   const limit = Math.max(1, Number(options.limit ?? DEFAULT_LIMIT))
-  const since = options.since ? Number(options.since) : undefined
+  const since = options.since === undefined ? undefined : Number(options.since)
 
   return [...sessions]
-    .filter((session) => !since || getSessionUpdatedTime(session) >= since)
+    .filter((session) => since === undefined || getSessionUpdatedTime(session) >= since)
     .sort((a, b) => getSessionUpdatedTime(b) - getSessionUpdatedTime(a))
     .slice(0, limit)
 }
@@ -25,6 +25,53 @@ export function selectSessionsByName(sessions, sessionName) {
   if (exact.length > 0) return exact
 
   return sessions.filter((session) => normalizeSessionTitle(session.title).includes(query))
+}
+
+export function resolvePeriodSince(period, now = new Date()) {
+  const key = String(period ?? "").trim().toLowerCase()
+  if (!key) return undefined
+
+  const today = startOfLocalDay(now)
+  switch (key) {
+    case "today":
+      return today.getTime()
+    case "yesterday":
+      return addDays(today, -1).getTime()
+    case "last3days":
+      return addDays(today, -2).getTime()
+    case "last7days":
+      return addDays(today, -6).getTime()
+    case "last30days":
+      return addDays(today, -29).getTime()
+    case "thisweek":
+      return startOfLocalWeek(today).getTime()
+    case "lastweek":
+      return addDays(startOfLocalWeek(today), -7).getTime()
+    case "thismonth":
+      return startOfLocalMonth(today).getTime()
+    case "lastmonth":
+      return addMonths(startOfLocalMonth(today), -1).getTime()
+    default:
+      return undefined
+  }
+}
+
+export function parseSinceDate(value) {
+  const text = String(value ?? "").trim()
+  if (!text) throw new Error("since must be an ISO date or datetime")
+
+  if (/^\d{4}-\d{2}-\d{2}$/.test(text)) {
+    return localDateStringToEpoch(text)
+  }
+
+  if (!/^\d{4}-\d{2}-\d{2}[T ]/.test(text)) {
+    throw new Error(`Invalid since value: ${text}`)
+  }
+
+  localDateStringToEpoch(text.slice(0, 10))
+  const time = Date.parse(text)
+  if (Number.isNaN(time)) throw new Error(`Invalid since value: ${text}`)
+  return time
 }
 
 export function formatSessionCandidatesForConfirmation({ sessionName, candidates }) {
@@ -257,6 +304,46 @@ function normalizeSessionTitle(value) {
 
 function getSessionUpdatedTime(session) {
   return Number(session?.time?.updated ?? session?.time_updated ?? 0)
+}
+
+function startOfLocalDay(date) {
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate())
+}
+
+function localDateStringToEpoch(text) {
+  const [yearText, monthText, dayText] = text.split("-").map(Number)
+  const date = new Date(yearText, monthText - 1, dayText)
+  if (!isValidLocalDate(date, yearText, monthText, dayText)) {
+    throw new Error(`Invalid since date: ${text}`)
+  }
+  return date.getTime()
+}
+
+function startOfLocalWeek(date) {
+  const daysSinceMonday = (date.getDay() + 6) % 7
+  return addDays(startOfLocalDay(date), -daysSinceMonday)
+}
+
+function startOfLocalMonth(date) {
+  return new Date(date.getFullYear(), date.getMonth(), 1)
+}
+
+function addDays(date, days) {
+  const result = new Date(date)
+  result.setDate(result.getDate() + days)
+  return result
+}
+
+function addMonths(date, months) {
+  return new Date(date.getFullYear(), date.getMonth() + months, date.getDate())
+}
+
+function isValidLocalDate(date, year, month, day) {
+  return (
+    date.getFullYear() === year &&
+    date.getMonth() === month - 1 &&
+    date.getDate() === day
+  )
 }
 
 function buildCandidatePreview(transcript) {

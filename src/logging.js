@@ -10,12 +10,21 @@ import {
   realpath,
   unlink,
 } from "node:fs/promises"
+import { homedir } from "node:os"
 import { isAbsolute, join, resolve, sep } from "node:path"
 
 const PRIVATE_DIRECTORY_MODE = 0o700
 const PRIVATE_FILE_MODE = 0o600
 const RUN_ID_PATTERN = /^\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-\d{3}Z-[a-zA-Z0-9]{1,12}$/
 const REPORT_CREATE_RETRIES = 10
+
+export function resolveLogDir() {
+  const xdgConfigRoot = process.env.XDG_CONFIG_HOME
+  const configRoot = xdgConfigRoot && isAbsolute(xdgConfigRoot)
+    ? xdgConfigRoot
+    : join(homedir(), ".config")
+  return join(configRoot, "opencode", "session-reflections")
+}
 
 export function createRunId(date = new Date(), entropy = randomUUID()) {
   const stamp = formatTimestamp(date)
@@ -29,6 +38,8 @@ export function buildRunManifest({
   action,
   limit,
   requestedSessionId,
+  period,
+  since,
   selectedSessions,
   skippedSessions,
   prompt,
@@ -40,6 +51,8 @@ export function buildRunManifest({
     action,
     limit,
     requestedSessionId: requestedSessionId ?? null,
+    period: period ?? null,
+    since: since ?? null,
     selectedSessions: selectedSessions.map(summarizeSession),
     skippedSessions,
     promptHash: hashValue(prompt),

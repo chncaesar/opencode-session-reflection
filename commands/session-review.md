@@ -8,6 +8,7 @@ Arguments:
 - If the user provides a number, use it as `limit`.
 - If the user provides a session id, pass it as `sessionID`.
 - If the user provides other text, pass it as `sessionName`.
+- If the user asks for a time range, map it to `period` (today, yesterday, last3days, last7days, last30days, thisWeek, lastWeek, thisMonth, lastMonth) or `since` (an ISO date like "2026-08-10"). Pass only one of `period`/`since`.
 - Otherwise use `limit: 8`.
 - If `sessionName` returns multiple candidates, show the candidate list to the user and ask which `sessionID` to use.
 

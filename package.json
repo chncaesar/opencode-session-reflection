@@ -15,7 +15,7 @@
   ],
   "scripts": {
     "test": "node --test \"test/*.test.mjs\"",
-    "check:import": "node -e \"import('./src/index.js').then((m) => { if (typeof m.default !== 'function') throw new Error('default export is not a plugin function'); console.log('plugin import ok') })\"",
+    "check:import": "node -e \"import('./src/index.js').then((m) => { const d = m.default; if (typeof d?.server !== 'function' || typeof d.id !== 'string') throw new Error('default export is not a V1 plugin module with id and server()'); console.log('plugin import ok') })\"",
     "prepublishOnly": "npm test && npm run check:import",
     "deploy": "node scripts/deploy.js",
     "undeploy": "node scripts/undeploy.js"

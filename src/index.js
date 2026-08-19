@@ -1,6 +1,4 @@
 // Tested by test/plugin.test.mjs; core behavior is covered by test/core.test.mjs.
-import { homedir } from "node:os"
-import { isAbsolute, join } from "node:path"
 import { tool } from "@opencode-ai/plugin"
 
 import {
@@ -9,6 +7,8 @@ import {
   formatSessionCandidatesForConfirmation,
   formatReflectionReport,
   MAX_EVIDENCE_CHARS,
+  parseSinceDate,
+  resolvePeriodSince,
   selectSessionsByName,
   selectSessionsForReview,
 } from "./core.js"
@@ -16,6 +16,7 @@ import {
   appendRunEvent,
   buildRunManifest,
   createRunId,
+  resolveLogDir,
   saveReportForRun,
   writeRunManifest,
 } from "./logging.js"
@@ -37,6 +38,18 @@ const plugin = async ({ client, _logDir } = {}) => {
           evidenceBudget: tool.schema.number().int().min(1).optional(),
           sessionID: tool.schema.string().optional(),
           sessionName: tool.schema.string().optional(),
+          period: tool.schema.enum([
+            "today",
+            "yesterday",
+            "last3days",
+            "last7days",
+            "last30days",
+            "thisWeek",
+            "lastWeek",
+            "thisMonth",
+            "lastMonth",
+          ]).optional(),
+          since: tool.schema.string().optional(),
           runID: tool.schema.string().optional(),
           analysis: tool.schema.string().optional(),
         },
@@ -81,6 +94,22 @@ const plugin = async ({ client, _logDir } = {}) => {
 
           const requestedSessionName = args.sessionName?.trim()
 
+          if (args.period && args.since) {
+            return "period and since are mutually exclusive. Choose one time filter."
+          }
+
+          let since
+          if (args.period) {
+            since = resolvePeriodSince(args.period)
+            if (since === undefined) return `Unknown period: ${args.period}`
+          } else if (args.since) {
+            try {
+              since = parseSinceDate(args.since)
+            } catch {
+              return `Invalid since value: ${args.since}`
+            }
+          }
+
           let selected
           if (args.sessionID) {
             const res = await client.session.get({ path: { id: args.sessionID } })
@@ -92,7 +121,10 @@ const plugin = async ({ client, _logDir } = {}) => {
             selected = selectSessionsByName(excludeCurrentSession(sessions, context.sessionID), requestedSessionName)
           } else {
             const sessions = await listSessionsPaged(client._client)
-            selected = selectSessionsForReview(excludeCurrentSession(sessions, context.sessionID), { limit: args.limit })
+            selected = selectSessionsForReview(excludeCurrentSession(sessions, context.sessionID), {
+              limit: args.limit,
+              since,
+            })
           }
 
           if (selected.length === 0) {
@@ -160,6 +192,8 @@ const plugin = async ({ client, _logDir } = {}) => {
             action: "collect",
             limit: args.limit,
             requestedSessionId: args.sessionID ?? null,
+            period: args.period ?? null,
+            since: since ?? null,
             selectedSessions: manifestSessions,
             skippedSessions,
             prompt,
@@ -189,7 +223,15 @@ const plugin = async ({ client, _logDir } = {}) => {
   }
 }
 
-export default plugin
+// OpenCode loads file plugins as V1 plugin modules: the default export must be
+// an object exposing `id` (required for path/file plugins) and a `server`
+// function. A legacy default-exported function is still supported, but OpenCode
+// then treats *every* exported function as an independent legacy plugin, which
+// would incorrectly invoke `listSessionsPaged` below with the plugin input.
+export default {
+  id: "opencode-session-reflection",
+  server: plugin,
+}
 
 function unwrapSdkArray(response, label) {
   const data = response && typeof response === "object" && "data" in response ? response.data : response
@@ -213,7 +255,7 @@ function unwrapSdkArray(response, label) {
  * @param {object} rawClient - client._client from the plugin context
  * @param {number} [options.pageSize] - sessions per request (default 200)
  */
-export async function listSessionsPaged(
+async function listSessionsPaged(
   rawClient,
   { pageSize = 200, maxPages = DEFAULT_MAX_SESSION_PAGES, search } = {},
 ) {
@@ -257,14 +299,6 @@ function readNextCursor(response) {
 function excludeCurrentSession(sessions, currentSessionId) {
   if (!currentSessionId) return sessions
   return sessions.filter((session) => session.id !== currentSessionId)
-}
-
-export function resolveLogDir() {
-  const xdgConfigRoot = process.env.XDG_CONFIG_HOME
-  const configRoot = xdgConfigRoot && isAbsolute(xdgConfigRoot)
-    ? xdgConfigRoot
-    : join(homedir(), ".config")
-  return join(configRoot, "opencode", "session-reflections")
 }
 
 function stableSessionListError() {
