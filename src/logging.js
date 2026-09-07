@@ -12,6 +12,7 @@ import {
 } from "node:fs/promises"
 import { homedir } from "node:os"
 import { isAbsolute, join, resolve, sep } from "node:path"
+import { DatabaseSync } from "node:sqlite"
 
 const PRIVATE_DIRECTORY_MODE = 0o700
 const PRIVATE_FILE_MODE = 0o600
@@ -24,6 +25,34 @@ export function resolveLogDir() {
     ? xdgConfigRoot
     : join(homedir(), ".config")
   return join(configRoot, "opencode", "session-reflections")
+}
+
+export function resolveReflectionDbPath(logDir) {
+  return join(logDir, "reflection.db")
+}
+
+export function resolveOpenCodeDbPath() {
+  const xdgDataHome = process.env.XDG_DATA_HOME
+  const dataRoot = xdgDataHome && isAbsolute(xdgDataHome)
+    ? xdgDataHome
+    : join(homedir(), ".local", "share")
+  return join(dataRoot, "opencode", "opencode.db")
+}
+
+export function openReflectionDb(dbPath) {
+  const db = new DatabaseSync(dbPath)
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS prompt_dump (
+      session_id         TEXT    NOT NULL,
+      seq                INTEGER NOT NULL,
+      created_at         INTEGER NOT NULL,
+      model              TEXT    NOT NULL,
+      system_total_chars INTEGER NOT NULL,
+      system_full        TEXT    NOT NULL,
+      PRIMARY KEY (session_id, seq)
+    )
+  `)
+  return db
 }
 
 export function createRunId(date = new Date(), entropy = randomUUID()) {
@@ -403,7 +432,7 @@ function formatTimestamp(date) {
 
 function sanitizeEntropy(value) {
   const entropy = String(value).replace(/[^a-zA-Z0-9]/g, "").slice(0, 32)
-  return entropy || randomUUID().replaceAll("-").slice(0, 16)
+  return entropy || randomUUID().replaceAll("-", "").slice(0, 16)
 }
 
 function temporaryFilePath(parentPath, label) {

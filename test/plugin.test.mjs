@@ -15,7 +15,7 @@ test("session-reflection plugin exposes the expected tool contract", async () =>
   const source = await readFile(pluginSource, "utf8")
 
   assert.match(source, /session_reflection/)
-  assert.match(source, /enum\(\["collect", "save"\]\)/)
+  assert.match(source, /enum\(\["collect", "save", "analyze_prompts"\]\)/)
   assert.match(source, /id: "opencode-session-reflection"/)
   assert.match(source, /server: plugin/)
   assert.match(source, /runID/)

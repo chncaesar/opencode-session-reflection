@@ -361,3 +361,167 @@ function truncateSingleLine(value, maxChars) {
   if (singleLine.length <= maxChars) return singleLine
   return `${singleLine.slice(0, maxChars)}...`
 }
+
+// ─── Prompt dump analysis ────────────────────────────────────────────────────
+
+/**
+ * Read prompt dump rows for a session from reflection.db.
+ *
+ * @param {import('node:sqlite').DatabaseSync} db
+ * @param {string} sessionId
+ * @param {"latest"|"trend"} mode
+ * @returns {Array<object>}
+ */
+export function readPromptDumps(db, sessionId, mode = "latest") {
+  if (mode === "latest") {
+    const row = db.prepare(
+      "SELECT * FROM prompt_dump WHERE session_id = ? ORDER BY seq DESC LIMIT 1",
+    ).get(sessionId)
+    if (!row) return []
+    return [{ ...row, system_full: JSON.parse(row.system_full) }]
+  }
+
+  const rows = db.prepare(
+    "SELECT * FROM prompt_dump WHERE session_id = ? ORDER BY seq ASC",
+  ).all(sessionId)
+  return rows.map((row) => ({ ...row, system_full: JSON.parse(row.system_full) }))
+}
+
+/**
+ * Read token stats for a session from opencode.db.
+ * Returns total input tokens, output tokens, cache read/write tokens,
+ * and the top tool results by character count.
+ *
+ * @param {import('node:sqlite').DatabaseSync} ocDb  opencode.db connection
+ * @param {string} sessionId
+ * @returns {object}
+ */
+export function readSessionTokenStats(ocDb, sessionId) {
+  const tokenRow = ocDb.prepare(`
+    SELECT
+      SUM(CAST(json_extract(data, '$.tokens.input')        AS INTEGER)) AS total_input,
+      SUM(CAST(json_extract(data, '$.tokens.output')       AS INTEGER)) AS total_output,
+      SUM(CAST(json_extract(data, '$.tokens.cache.read')   AS INTEGER)) AS cache_read,
+      SUM(CAST(json_extract(data, '$.tokens.cache.write')  AS INTEGER)) AS cache_write
+    FROM message
+    WHERE session_id = ?
+  `).get(sessionId)
+
+  const toolRows = ocDb.prepare(`
+    SELECT
+      json_extract(p.data, '$.tool')                AS tool_name,
+      LENGTH(json_extract(p.data, '$.state.output')) AS output_chars
+    FROM part p
+    JOIN message m ON p.message_id = m.id
+    WHERE m.session_id = ?
+      AND json_extract(p.data, '$.type') = 'tool'
+      AND json_extract(p.data, '$.state.status') = 'completed'
+      AND json_extract(p.data, '$.state.output') IS NOT NULL
+    ORDER BY output_chars DESC
+    LIMIT 5
+  `).all(sessionId)
+
+  return {
+    total_input:  tokenRow?.total_input  ?? 0,
+    total_output: tokenRow?.total_output ?? 0,
+    cache_read:   tokenRow?.cache_read   ?? 0,
+    cache_write:  tokenRow?.cache_write  ?? 0,
+    top_tool_outputs: toolRows ?? [],
+  }
+}
+
+const ANALYZE_MAX_SYSTEM_CHARS = 40_000
+
+/**
+ * Build the analysis prompt fed to the LLM for analyze_prompts action.
+ *
+ * @param {object} opts
+ * @param {Array<object>} opts.dumps       rows from readPromptDumps()
+ * @param {object}        opts.tokenStats  result of readSessionTokenStats()
+ * @param {string}        opts.mode        "latest" | "trend"
+ * @param {string}        opts.directory   current project directory
+ */
+export function buildPromptAnalysis({ dumps, tokenStats, mode, directory }) {
+  if (dumps.length === 0) {
+    return "No prompt dump data found for this session. Make sure the session has made at least one LLM request."
+  }
+
+  const lines = []
+
+  lines.push("# OpenCode Context Analysis")
+  lines.push("")
+  lines.push(`Project: ${directory ?? "(unknown)"}`)
+  lines.push(`Mode: ${mode}`)
+  lines.push("")
+
+  // ── Token stats ───────────────────────────────────────────────────────────
+  lines.push("## Token Budget (session total)")
+  lines.push("")
+  lines.push(`- Input tokens:       ${tokenStats.total_input}`)
+  lines.push(`- Output tokens:      ${tokenStats.total_output}`)
+  lines.push(`- Cache read tokens:  ${tokenStats.cache_read}`)
+  lines.push(`- Cache write tokens: ${tokenStats.cache_write}`)
+  lines.push("")
+
+  // ── Top tool outputs ──────────────────────────────────────────────────────
+  if (tokenStats.top_tool_outputs.length > 0) {
+    lines.push("## Largest Tool Outputs (top 5 by character count)")
+    lines.push("")
+    for (const row of tokenStats.top_tool_outputs) {
+      lines.push(`- ${row.tool_name ?? "unknown"}: ${row.output_chars ?? 0} chars`)
+    }
+    lines.push("")
+  }
+
+  // ── System prompt(s) ──────────────────────────────────────────────────────
+  if (mode === "trend") {
+    lines.push("## System Prompt Size Trend")
+    lines.push("")
+    for (const row of dumps) {
+      const date = new Date(row.created_at).toISOString()
+      lines.push(`- seq ${row.seq} | ${date} | ${row.model} | ${row.system_total_chars} chars`)
+    }
+    lines.push("")
+    lines.push("(Full system prompt content omitted in trend mode. Re-run with mode=latest for content analysis.)")
+  } else {
+    const dump = dumps[0]
+    lines.push(`## System Prompt (seq ${dump.seq}, model: ${dump.model})`)
+    lines.push("")
+    lines.push(`Total chars: ${dump.system_total_chars}`)
+    lines.push(`Segments: ${dump.system_full.length}`)
+    lines.push("")
+
+    let remainingChars = ANALYZE_MAX_SYSTEM_CHARS
+    for (let i = 0; i < dump.system_full.length; i++) {
+      const seg = dump.system_full[i]
+      lines.push(`### Segment ${i} (${seg.length} chars)`)
+      lines.push("")
+      if (seg.length <= remainingChars) {
+        lines.push(seg)
+        remainingChars -= seg.length
+      } else {
+        lines.push(seg.slice(0, remainingChars) + "\n...[truncated]")
+        remainingChars = 0
+      }
+      lines.push("")
+      if (remainingChars <= 0) {
+        lines.push(`_(${dump.system_full.length - i - 1} more segments truncated due to size limit)_`)
+        break
+      }
+    }
+  }
+
+  // ── Instructions to the LLM ───────────────────────────────────────────────
+  lines.push("---")
+  lines.push("")
+  lines.push("## Analysis Instructions")
+  lines.push("")
+  lines.push("Based on the data above, please provide:")
+  lines.push("")
+  lines.push("1. **Context composition**: estimate what % of total input tokens is system prompt vs conversation history vs tool results.")
+  lines.push("2. **System prompt assessment**: which segments appear necessary for the current project, which look generic or unrelated.")
+  lines.push("3. **Tool output assessment**: are any of the top tool outputs disproportionately large? Could they be truncated?")
+  lines.push("4. **Concrete optimisation suggestions**: specific items to remove or shorten, with estimated token savings.")
+
+  return lines.join("\n")
+}

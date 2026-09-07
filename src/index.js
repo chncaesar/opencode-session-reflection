@@ -1,13 +1,20 @@
 // Tested by test/plugin.test.mjs; core behavior is covered by test/core.test.mjs.
 import { tool } from "@opencode-ai/plugin"
+import { mkdirSync } from "node:fs"
+import { homedir } from "node:os"
+import { join, isAbsolute } from "node:path"
+import { DatabaseSync } from "node:sqlite"
 
 import {
   buildReflectionPrompt,
+  buildPromptAnalysis,
   extractTranscript,
   formatSessionCandidatesForConfirmation,
   formatReflectionReport,
   MAX_EVIDENCE_CHARS,
   parseSinceDate,
+  readPromptDumps,
+  readSessionTokenStats,
   resolvePeriodSince,
   selectSessionsByName,
   selectSessionsForReview,
@@ -17,6 +24,9 @@ import {
   buildRunManifest,
   createRunId,
   resolveLogDir,
+  resolveReflectionDbPath,
+  resolveOpenCodeDbPath,
+  openReflectionDb,
   saveReportForRun,
   writeRunManifest,
 } from "./logging.js"
@@ -27,13 +37,57 @@ const EVIDENCE_BUDGET_ENV = "SESSION_REFLECTION_EVIDENCE_BUDGET"
 
 const plugin = async ({ client, _logDir } = {}) => {
   const logDir = _logDir ?? resolveLogDir()
+
+  // Initialise the reflection DB once at plugin startup (sync, fast).
+  // mkdirSync ensures the directory exists before DatabaseSync opens the file.
+  mkdirSync(logDir, { recursive: true })
+  const dbPath = resolveReflectionDbPath(logDir)
+  const db = openReflectionDb(dbPath)
+
+  const insertDump = db.prepare(`
+    INSERT OR REPLACE INTO prompt_dump
+      (session_id, seq, created_at, model, system_total_chars, system_full)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `)
+
+  const nextSeq = db.prepare(`
+    SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq
+    FROM prompt_dump
+    WHERE session_id = ?
+  `)
+
   return {
+    // ── Capture the full system prompt on every real LLM request ─────────
+    "experimental.chat.system.transform": async (input, output) => {
+      // Skip Agent.generate path which has no sessionID
+      if (!input.sessionID) return
+
+      const seq = nextSeq.get(input.sessionID).next_seq
+      const systemFull = [...output.system]
+      const totalChars = systemFull.reduce((sum, s) => sum + s.length, 0)
+      const modelId = input.model?.id ?? input.model ?? "unknown"
+
+      try {
+        insertDump.run(
+          input.sessionID,
+          seq,
+          Date.now(),
+          modelId,
+          totalChars,
+          JSON.stringify(systemFull),
+        )
+      } catch (err) {
+        // Non-fatal: log and continue. Never block the LLM request.
+        console.error("[session-reflection] prompt_dump write failed:", err?.message)
+      }
+    },
+
     tool: {
       session_reflection: tool({
         description:
-          "Collect OpenCode session conversation content for qualitative reflection, or save the final reflection report locally.",
+          "Collect OpenCode session conversation content for qualitative reflection, save the final reflection report locally, or analyze the system prompt and context composition for the current session.",
         args: {
-          action: tool.schema.enum(["collect", "save"]).default("collect"),
+          action: tool.schema.enum(["collect", "save", "analyze_prompts"]).default("collect"),
           limit: tool.schema.number().int().min(1).max(30).default(8),
           evidenceBudget: tool.schema.number().int().min(1).optional(),
           sessionID: tool.schema.string().optional(),
@@ -52,8 +106,52 @@ const plugin = async ({ client, _logDir } = {}) => {
           since: tool.schema.string().optional(),
           runID: tool.schema.string().optional(),
           analysis: tool.schema.string().optional(),
+          mode: tool.schema.enum(["latest", "trend"]).default("latest"),
         },
         async execute(args, context) {
+          if (args.action === "analyze_prompts") {
+            const targetSessionId = args.sessionID ?? context.sessionID
+            if (!targetSessionId) {
+              return "analyze_prompts requires a sessionID. Pass sessionID explicitly or run inside an active session."
+            }
+
+            const dumps = readPromptDumps(db, targetSessionId, args.mode)
+
+            if (dumps.length === 0) {
+              return `No prompt dump data found for session ${targetSessionId}. The session may not have made any LLM requests yet, or it predates the prompt dump feature.`
+            }
+
+            let tokenStats = { total_input: 0, total_output: 0, cache_read: 0, cache_write: 0, top_tool_outputs: [] }
+            let ocDb
+            try {
+              const ocDbPath = resolveOpenCodeDbPath()
+              ocDb = new DatabaseSync(ocDbPath, { readonly: true })
+              tokenStats = readSessionTokenStats(ocDb, targetSessionId)
+            } catch (err) {
+              // Non-fatal: token stats unavailable, continue with system prompt only
+              console.error("[session-reflection] opencode.db read failed:", err?.message)
+            } finally {
+              ocDb?.close()
+            }
+
+            const analysisPrompt = buildPromptAnalysis({
+              dumps,
+              tokenStats,
+              mode: args.mode,
+              directory: context.directory,
+            })
+
+            return {
+              title: "Context analysis prompt",
+              output: analysisPrompt,
+              metadata: {
+                sessionID: targetSessionId,
+                mode: args.mode,
+                dumpCount: dumps.length,
+              },
+            }
+          }
+
           if (args.action === "save") {
             if (!args.analysis?.trim()) {
               return "Save failed: analysis must not be empty."

@@ -1,6 +1,6 @@
 {
   "name": "opencode-session-reflection",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Turn OpenCode session failures into reusable reliability improvements.",
   "type": "module",
   "main": "./src/index.js",
@@ -41,6 +41,6 @@
     "@opencode-ai/plugin": "^1.17.11"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22.5.0"
   }
 }
