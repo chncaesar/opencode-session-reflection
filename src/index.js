@@ -35,6 +35,10 @@ const DEFAULT_MAX_SESSION_PAGES = 100
 const SAVE_AUDIT_WARNING = "The report was saved, but its audit event could not be recorded."
 const EVIDENCE_BUDGET_ENV = "SESSION_REFLECTION_EVIDENCE_BUDGET"
 
+// Close handles for the DB opened by each `plugin()` call, so the V2 `setup`
+// cleanup can release it without changing the V1 hooks object shape.
+const closers = new WeakMap()
+
 const plugin = async ({ client, _logDir } = {}) => {
   const logDir = _logDir ?? resolveLogDir()
 
@@ -56,7 +60,7 @@ const plugin = async ({ client, _logDir } = {}) => {
     WHERE session_id = ?
   `)
 
-  return {
+  const hooks = {
     // ── Capture the full system prompt on every real LLM request ─────────
     "experimental.chat.system.transform": async (input, output) => {
       // Skip Agent.generate path which has no sessionID
@@ -319,16 +323,184 @@ const plugin = async ({ client, _logDir } = {}) => {
       }),
     },
   }
+  closers.set(hooks, () => db.close())
+  return hooks
 }
 
-// OpenCode loads file plugins as V1 plugin modules: the default export must be
-// an object exposing `id` (required for path/file plugins) and a `server`
-// function. A legacy default-exported function is still supported, but OpenCode
-// then treats *every* exported function as an independent legacy plugin, which
-// would incorrectly invoke `listSessionsPaged` below with the plugin input.
+// ── V2 (OpenCode >= 2.x) entry point ────────────────────────────────────────
+// The V2 loader requires a default export with `id` and `setup(ctx)` and ignores
+// `server`. `setup` reuses the V1 `plugin()` logic unchanged by handing it a
+// facade `client` built on `ctx.session.*`, then registers its hooks/tool via
+// the V2 registration APIs. Nothing in V2 is registered twice with V1: a host
+// uses exactly one of `setup` / `server`.
+
+const TOOL_INPUT_SCHEMA = {
+  type: "object",
+  properties: {
+    action: { type: "string", enum: ["collect", "save", "analyze_prompts"], default: "collect" },
+    limit: { type: "integer", minimum: 1, maximum: 30, default: 8 },
+    evidenceBudget: { type: "integer", minimum: 1 },
+    sessionID: { type: "string" },
+    sessionName: { type: "string" },
+    period: {
+      type: "string",
+      enum: [
+        "today", "yesterday", "last3days", "last7days", "last30days",
+        "thisWeek", "lastWeek", "thisMonth", "lastMonth",
+      ],
+    },
+    since: { type: "string" },
+    runID: { type: "string" },
+    analysis: { type: "string" },
+    mode: { type: "string", enum: ["latest", "trend"], default: "latest" },
+  },
+}
+
+const V2_LIST_PAGE_SIZE = 50
+
+async function setup(ctx) {
+  const client = buildV2Client(ctx)
+  const hooks = await plugin({ client, directory: ctx.location?.directory })
+  const registrations = []
+
+  try {
+    const systemTransform = hooks["experimental.chat.system.transform"]
+    registrations.push(
+      await ctx.session.hook("context", (input) => {
+        // V2 `system` is an array of { type: "text", text } parts; V1 used strings.
+        const output = { system: (input.system ?? []).map((part) => (typeof part === "string" ? part : part?.text ?? "")) }
+        return systemTransform({ sessionID: input.sessionID, model: input.model }, output)
+      }),
+    )
+
+    const definition = hooks.tool.session_reflection
+    const argsSchema = tool.schema.object(definition.args)
+    registrations.push(
+      await ctx.tool.transform((editor) => {
+        editor.add({
+          name: "session_reflection",
+          description: definition.description,
+          input: TOOL_INPUT_SCHEMA,
+          options: { codemode: false },
+          execute: async (rawArgs, context) => {
+            const args = argsSchema.parse(rawArgs ?? {})
+            const result = await definition.execute(args, {
+              sessionID: context.sessionID,
+              agent: context.agent,
+              directory: ctx.location?.directory,
+            })
+            if (typeof result === "string") return { content: result }
+            const { title, output, metadata } = result
+            return { content: output, metadata: { ...(title ? { title } : {}), ...metadata } }
+          },
+        })
+      }),
+    )
+  } catch (err) {
+    await disposeAll(registrations, closers.get(hooks))
+    throw err
+  }
+
+  return () => disposeAll(registrations, closers.get(hooks))
+}
+
+async function disposeAll(registrations, closeDb) {
+  for (const registration of registrations.reverse()) {
+    try {
+      await registration.dispose()
+    } catch (err) {
+      console.error("[session-reflection] dispose failed:", err?.message)
+    }
+  }
+  try {
+    closeDb?.()
+  } catch {
+    // already closed
+  }
+}
+
+/**
+ * Adapt a V2 plugin context into the V1 `client` surface that `plugin()` uses:
+ * `session.get`, `session.messages` and `_client.get("/experimental/session")`.
+ * Note: V2 exposes only the model context window (`session.context`), so
+ * messages dropped by compaction are not visible to transcript extraction.
+ */
+function buildV2Client(ctx) {
+  return {
+    session: {
+      get: async ({ path }) => {
+        try {
+          return { data: toV1Session(await ctx.session.get({ sessionID: path.id })) }
+        } catch (error) {
+          return { data: undefined, error }
+        }
+      },
+      messages: async ({ path }) => {
+        const [entries, session] = await Promise.all([
+          ctx.session.context({ sessionID: path.id }),
+          ctx.session.get({ sessionID: path.id }),
+        ])
+        return { data: toV1Messages(entries, session) }
+      },
+    },
+    _client: {
+      get: async ({ url, query = {} }) => {
+        if (url !== "/experimental/session") throw new Error(`Unsupported request: ${url}`)
+        const input = query.cursor
+          ? { cursor: query.cursor, limit: V2_LIST_PAGE_SIZE }
+          : { limit: V2_LIST_PAGE_SIZE, ...(query.search ? { search: query.search } : {}) }
+        const page = await ctx.session.list(input)
+        const entries = Array.isArray(page) ? page : page?.data
+        if (!Array.isArray(entries)) return { error: new Error("invalid session page") }
+        const next = Array.isArray(page) ? undefined : page.cursor?.next
+        return {
+          data: entries.map(toV1Session),
+          response: { headers: new Headers(next ? { "x-next-cursor": String(next) } : {}) },
+        }
+      },
+    },
+  }
+}
+
+function toV1Session(info) {
+  if (!info || typeof info !== "object") return info
+  const directory = info.directory ?? info.location?.directory
+  return directory === undefined ? info : { ...info, directory }
+}
+
+function toV1Messages(entries, session) {
+  return entries.flatMap((entry) => {
+    const info = {
+      id: entry.id,
+      role: entry.type === "assistant" ? "assistant" : "user",
+      sessionID: session?.id,
+      time: { created: entry.time?.created },
+    }
+    if (entry.type === "assistant") {
+      const parts = (entry.content ?? []).map((part) =>
+        part.type === "tool"
+          ? { type: "tool", tool: part.name, state: part.state }
+          : { type: part.type, text: part.text },
+      )
+      return [{ info, parts }]
+    }
+    if (entry.type === "user") {
+      return [{ info, parts: [{ type: "text", text: entry.text ?? "" }] }]
+    }
+    // Skill/synthetic/shell/location entries are system-generated, not developer speech.
+    return []
+  })
+}
+
+// OpenCode >= 2.x loads plugins through `setup`; 1.x loads V1 plugin modules
+// through `server`. Both need `id`. A legacy default-exported function is still
+// supported by 1.x, but it then treats *every* exported function as an
+// independent legacy plugin, which would incorrectly invoke `listSessionsPaged`
+// below with the plugin input.
 export default {
   id: "opencode-session-reflection",
   server: plugin,
+  setup,
 }
 
 function unwrapSdkArray(response, label) {
