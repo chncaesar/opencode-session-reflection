@@ -1,6 +1,6 @@
 {
   "name": "opencode-session-reflection",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Turn OpenCode session failures into reusable reliability improvements.",
   "type": "module",
   "main": "./src/index.js",
